@@ -74,7 +74,8 @@ class MemoryRepository(
         }.getOrDefault(emptyList())
         if (direct.isNotEmpty()) return direct
         if (!rootAccess.isGranted()) return emptyList()
-        return rootAccess.run("for d in /sys/block/zram*; do [ -e \"$d\" ] && basename \"$d\"; done")
+        val dollar = '$'
+        return rootAccess.run("for d in /sys/block/zram*; do [ -e \"${dollar}d\" ] && basename \"${dollar}d\"; done")
             ?.lineSequence()
             ?.map(String::trim)
             ?.filter { it.matches(Regex("zram\\d+")) }
