@@ -7,7 +7,9 @@ data class MemorySnapshot(
     val totalSwapBytes: Long,
     val usedSwapBytes: Long,
     val swapDevices: List<SwapDevice>,
-    val zramDevices: List<ZramDevice>
+    val zramDevices: List<ZramDevice>,
+    val vmStats: VmStats,
+    val pressure: MemoryPressure?
 )
 
 data class SwapDevice(
@@ -28,11 +30,26 @@ data class ZramDevice(
     val peakMemoryUsedBytes: Long,
     val samePages: Long,
     val compactedPages: Long,
+    val hugePages: Long,
     val compressionAlgorithm: String?
 ) {
-    val savedBytes: Long
+    val ramSavedBytes: Long
         get() = (originalDataBytes - memoryUsedBytes).coerceAtLeast(0)
 
     val compressionRatio: Double?
+        get() = if (compressedDataBytes > 0) originalDataBytes.toDouble() / compressedDataBytes else null
+
+    val effectiveRamRatio: Double?
         get() = if (memoryUsedBytes > 0) originalDataBytes.toDouble() / memoryUsedBytes else null
 }
+
+data class VmStats(
+    val swappiness: Int?,
+    val swapInPages: Long?,
+    val swapOutPages: Long?
+)
+
+data class MemoryPressure(
+    val someAvg10: Double?,
+    val fullAvg10: Double?
+)
