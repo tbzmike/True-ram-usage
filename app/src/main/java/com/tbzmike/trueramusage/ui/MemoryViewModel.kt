@@ -68,11 +68,13 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
-    var displayMode by mutableStateOf(preferences.displayMode)
-        private set
+    private var displayModeState by mutableStateOf(preferences.displayMode)
+    val displayMode: DisplayMode
+        get() = displayModeState
 
-    var themeMode by mutableStateOf(preferences.themeMode)
-        private set
+    private var themeModeState by mutableStateOf(preferences.themeMode)
+    val themeMode: ThemeMode
+        get() = themeModeState
 
     init {
         viewModelScope.launch {
@@ -83,13 +85,13 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun updateDisplayMode(mode: DisplayMode) {
-        displayMode = mode
+    fun setDisplayMode(mode: DisplayMode) {
+        displayModeState = mode
         preferences.displayMode = mode
     }
 
-    fun updateThemeMode(mode: ThemeMode) {
-        themeMode = mode
+    fun setThemeMode(mode: ThemeMode) {
+        themeModeState = mode
         preferences.themeMode = mode
     }
 
