@@ -18,9 +18,7 @@ class AppSwapRepository(
         val packagesByUid = mutableMapOf<Int, List<String>>()
 
         return processes
-            .mapNotNull { process ->
-                resolveProcess(process, packagesByUid)
-            }
+            .mapNotNull { process -> resolveProcess(process, packagesByUid) }
             .groupBy { it.packageName }
             .map { (packageName, resolved) ->
                 val appInfo = resolved.first().appInfo
@@ -39,7 +37,7 @@ class AppSwapRepository(
                     processes = processList.sortedByDescending { it.swapBytes }
                 )
             }
-            .filter { it.attributedSwapBytes > 0 }
+            .filter { it.attributedSwapBytes > 0L }
             .sortedByDescending { it.attributedSwapBytes }
     }
 
@@ -47,6 +45,17 @@ class AppSwapRepository(
         process: ProcessSwapUsage,
         packagesByUid: MutableMap<Int, List<String>>
     ): ResolvedProcess? {
+        // Android app process cmdlines normally begin with the package name. Prefer
+        // that direct mapping, but verify the UID so a process name can never be
+        // used to attribute another application's memory.
+        val directPackage = process.processName.substringBefore(':')
+        if (directPackage.isNotBlank()) {
+            val directInfo = getApplicationInfo(directPackage)
+            if (directInfo != null && directInfo.uid == process.uid) {
+                return ResolvedProcess(process, directPackage, directInfo)
+            }
+        }
+
         val packages = packagesByUid.getOrPut(process.uid) {
             runCatching { packageManager.getPackagesForUid(process.uid)?.toList().orEmpty() }
                 .getOrDefault(emptyList())
@@ -62,6 +71,7 @@ class AppSwapRepository(
         } ?: return null
 
         val appInfo = getApplicationInfo(packageName) ?: return null
+        if (appInfo.uid != process.uid) return null
         return ResolvedProcess(process, packageName, appInfo)
     }
 
@@ -71,16 +81,16 @@ class AppSwapRepository(
     }.getOrNull()
 
     private fun readProcessSwapUsage(): List<ProcessSwapUsage> {
-        // First pass: one grep process reads only the inexpensive status fields for
-        // every PID. smaps/smaps_rollup are deliberately not touched here because
-        // they can take many seconds on phones with many mappings.
+        // One root command reads only the inexpensive status fields for all PIDs.
+        // Do not walk smaps/smaps_rollup here: those files can be very expensive on
+        // Android processes with many mappings.
         val statusResult = rootAccess.runResult(
-            "grep -H -E '^(Uid|VmRSS|VmSwap):' /proc/[0-9]*/status 2>/dev/null || true",
-            timeoutSeconds = 5
+            "grep -H -e '^Uid:' -e '^VmRSS:' -e '^VmSwap:' /proc/[0-9]*/status 2>/dev/null || true",
+            timeoutSeconds = 8
         ) ?: error("The root process scanner could not be started.")
 
         if (statusResult.timedOut) {
-            error("The fast per-app swap scan timed out while reading /proc status files.")
+            error("The per-app swap scan timed out while reading process status files.")
         }
         if (!statusResult.success) {
             error("The kernel process status scan failed.")
@@ -107,17 +117,22 @@ class AppSwapRepository(
     }
 
     private fun parseStatusOutput(output: String): List<RawProcessStatus> {
-        val linePattern = Regex("^/proc/(\\d+)/status:(Uid|VmRSS|VmSwap):\\s+(.+)$")
+        val linePattern = Regex("^/proc/(\\d+)/status:(Uid|VmRSS|VmSwap):\\s*(.*)$")
         val byPid = linkedMapOf<Int, MutableProcessStatus>()
 
-        output.lineSequence().forEach { line ->
-            val match = linePattern.matchEntire(line.trim()) ?: return@forEach
+        output.lineSequence().forEach { rawLine ->
+            val match = linePattern.matchEntire(rawLine.trim()) ?: return@forEach
             val pid = match.groupValues[1].toIntOrNull() ?: return@forEach
             val field = match.groupValues[2]
-            val firstNumber = match.groupValues[3]
-                .trim()
-                .substringBefore(' ')
-                .toLongOrNull()
+
+            // /proc/<pid>/status uses arbitrary whitespace (normally tabs on Uid:).
+            // Reading the first digit run is therefore safer than splitting only on
+            // ASCII spaces.
+            val firstNumber = Regex("^\\s*(\\d+)")
+                .find(match.groupValues[3])
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toLongOrNull()
                 ?: return@forEach
 
             val current = byPid.getOrPut(pid) { MutableProcessStatus() }
@@ -142,7 +157,7 @@ class AppSwapRepository(
     private fun readProcessNames(pids: List<Int>): Map<Int, String> {
         if (pids.isEmpty()) return emptyMap()
 
-        val pidList = pids.joinToString(" ")
+        val pidList = pids.distinct().joinToString(" ")
         val dollar = '$'
         val script =
             "for pid in $pidList; do " +
@@ -151,7 +166,7 @@ class AppSwapRepository(
                 "printf '%s\\t%s\\n' \"${dollar}pid\" \"${dollar}name\"; " +
                 "done"
 
-        val result = rootAccess.runResult(script, timeoutSeconds = 3) ?: return emptyMap()
+        val result = rootAccess.runResult(script, timeoutSeconds = 4) ?: return emptyMap()
         if (!result.success) return emptyMap()
 
         return result.output.lineSequence()
