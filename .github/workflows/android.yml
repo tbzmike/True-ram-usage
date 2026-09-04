@@ -34,7 +34,7 @@ jobs:
           test -n "$APKSIGNER"
           CERT_OUTPUT="$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk)"
           echo "$CERT_OUTPUT"
-          CERT_SHA256="$(printf '%s\n' "$CERT_OUTPUT" | awk -F': ' 'tolower($0) ~ /certificate sha-256 digest/ {print tolower($2); exit}')"
+          CERT_SHA256="$(printf '%s\n' "$CERT_OUTPUT" | awk -F': ' 'tolower($0) ~ /certificate sha-256 digest/ {print tolower($NF); exit}')"
           EXPECTED_SHA256="1a3d8693351e6536fba6c900526850a878a0827bc1aa806ced994ec4b9da36ec"
           echo "APK signing SHA-256: $CERT_SHA256"
           test -n "$CERT_SHA256"
