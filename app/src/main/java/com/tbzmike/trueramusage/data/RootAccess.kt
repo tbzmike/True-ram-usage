@@ -9,6 +9,15 @@ enum class RootState {
     UNAVAILABLE
 }
 
+data class RootCommandResult(
+    val exitCode: Int?,
+    val output: String,
+    val timedOut: Boolean
+) {
+    val success: Boolean
+        get() = !timedOut && exitCode == 0
+}
+
 class RootAccess {
     @Volatile
     private var granted = false
@@ -17,28 +26,38 @@ class RootAccess {
 
     fun request(): RootState {
         val result = execute("id -u", timeoutSeconds = 30)
-        granted = result?.lineSequence()?.firstOrNull()?.trim() == "0"
-        return when {
-            granted -> RootState.GRANTED
-            result == null -> RootState.DENIED_OR_TIMED_OUT
-            else -> RootState.DENIED_OR_TIMED_OUT
-        }
+            ?: return RootState.UNAVAILABLE
+        granted = result.success && result.output.lineSequence().firstOrNull()?.trim() == "0"
+        return if (granted) RootState.GRANTED else RootState.DENIED_OR_TIMED_OUT
     }
 
-    fun run(command: String): String? {
+    fun run(command: String, timeoutSeconds: Long = 8): String? {
         if (!granted) return null
-        return execute(command, timeoutSeconds = 5)
+        val result = execute(command, timeoutSeconds) ?: return null
+        return if (result.success) result.output else null
     }
 
-    private fun execute(command: String, timeoutSeconds: Long): String? = runCatching {
+    fun runResult(command: String, timeoutSeconds: Long = 8): RootCommandResult? {
+        if (!granted) return null
+        return execute(command, timeoutSeconds)
+    }
+
+    private fun execute(command: String, timeoutSeconds: Long): RootCommandResult? = runCatching {
         val process = ProcessBuilder("su", "-c", command)
             .redirectErrorStream(true)
             .start()
         if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
             process.destroyForcibly()
-            return@runCatching null
+            return@runCatching RootCommandResult(
+                exitCode = null,
+                output = "",
+                timedOut = true
+            )
         }
-        val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-        if (process.exitValue() == 0) output else null
+        RootCommandResult(
+            exitCode = process.exitValue(),
+            output = process.inputStream.bufferedReader().use { it.readText() }.trim(),
+            timedOut = false
+        )
     }.getOrNull()
 }

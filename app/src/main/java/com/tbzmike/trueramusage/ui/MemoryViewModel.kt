@@ -1,25 +1,35 @@
 package com.tbzmike.trueramusage.ui
 
+import android.app.Application
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.tbzmike.trueramusage.data.AppSwapRepository
+import com.tbzmike.trueramusage.data.AppSwapUsage
+import com.tbzmike.trueramusage.data.MemoryActions
 import com.tbzmike.trueramusage.data.MemoryRepository
 import com.tbzmike.trueramusage.data.MemorySnapshot
 import com.tbzmike.trueramusage.data.RootAccess
 import com.tbzmike.trueramusage.data.RootState
+import com.tbzmike.trueramusage.data.ZramClearSafety
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-class MemoryViewModel : ViewModel() {
+class MemoryViewModel(application: Application) : AndroidViewModel(application) {
     private val rootAccess = RootAccess()
     private val repository = MemoryRepository(rootAccess)
+    private val appSwapRepository = AppSwapRepository(application, rootAccess)
+    private val memoryActions = MemoryActions(rootAccess)
 
     var snapshot by mutableStateOf<MemorySnapshot?>(null)
+        private set
+
+    var appsInZram by mutableStateOf<List<AppSwapUsage>>(emptyList())
         private set
 
     var rootState by mutableStateOf(RootState.NOT_REQUESTED)
@@ -28,20 +38,49 @@ class MemoryViewModel : ViewModel() {
     var rootRequestInProgress by mutableStateOf(false)
         private set
 
+    var appsScanInProgress by mutableStateOf(false)
+        private set
+
+    var actionInProgress by mutableStateOf(false)
+        private set
+
+    var actionMessage by mutableStateOf<String?>(null)
+        private set
+
+    var actionError by mutableStateOf<String?>(null)
+        private set
+
+    var zramClearSafety by mutableStateOf<ZramClearSafety?>(null)
+        private set
+
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
     init {
         viewModelScope.launch {
             while (isActive) {
-                refresh()
+                refreshMemory()
                 delay(2_000)
+            }
+        }
+        viewModelScope.launch {
+            while (isActive) {
+                if (rootState == RootState.GRANTED) refreshApps()
+                delay(5_000)
             }
         }
     }
 
     fun refreshNow() {
-        viewModelScope.launch { refresh() }
+        viewModelScope.launch {
+            refreshMemory()
+            if (rootState == RootState.GRANTED) refreshApps()
+        }
+    }
+
+    fun refreshAppsNow() {
+        if (rootState != RootState.GRANTED) return
+        viewModelScope.launch { refreshApps() }
     }
 
     fun requestRoot() {
@@ -50,18 +89,71 @@ class MemoryViewModel : ViewModel() {
             rootRequestInProgress = true
             rootState = withContext(Dispatchers.IO) { rootAccess.request() }
             rootRequestInProgress = false
-            refresh()
+            refreshMemory()
+            if (rootState == RootState.GRANTED) refreshApps()
         }
     }
 
-    private suspend fun refresh() {
+    fun closeAndRelease(app: AppSwapUsage) {
+        if (actionInProgress) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            val result = withContext(Dispatchers.IO) {
+                memoryActions.closeApp(app.packageName, app.isSystemApp)
+            }
+            if (result.success) actionMessage = result.message else actionError = result.message
+            delay(700)
+            refreshMemory()
+            refreshApps()
+            actionInProgress = false
+        }
+    }
+
+    fun clearKernelZram() {
+        val current = snapshot ?: return
+        if (actionInProgress) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            val result = withContext(Dispatchers.IO) {
+                memoryActions.clearKernelZram(current)
+            }
+            if (result.success) actionMessage = result.message else actionError = result.message
+            delay(700)
+            refreshMemory()
+            refreshApps()
+            actionInProgress = false
+        }
+    }
+
+    fun clearActionMessage() {
+        actionMessage = null
+        actionError = null
+    }
+
+    private suspend fun refreshMemory() {
         runCatching {
             withContext(Dispatchers.IO) { repository.readSnapshot() }
         }.onSuccess {
             snapshot = it
+            zramClearSafety = memoryActions.getClearSafety(it)
             errorMessage = null
         }.onFailure {
             errorMessage = it.message ?: "Unable to read memory information"
         }
+    }
+
+    private suspend fun refreshApps() {
+        if (appsScanInProgress || rootState != RootState.GRANTED) return
+        appsScanInProgress = true
+        runCatching {
+            withContext(Dispatchers.IO) { appSwapRepository.readAppsUsingSwap() }
+        }.onSuccess {
+            appsInZram = it
+        }.onFailure {
+            actionError = "Per-app ZRAM usage could not be read on this kernel."
+        }
+        appsScanInProgress = false
     }
 }

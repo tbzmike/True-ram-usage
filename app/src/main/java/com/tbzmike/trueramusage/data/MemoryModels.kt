@@ -10,7 +10,13 @@ data class MemorySnapshot(
     val zramDevices: List<ZramDevice>,
     val vmStats: VmStats,
     val pressure: MemoryPressure?
-)
+) {
+    val kernelZramSwapUsedBytes: Long
+        get() = swapDevices.filter { it.isZram }.sumOf { it.usedBytes }
+
+    val activeZramSwapDevices: List<SwapDevice>
+        get() = swapDevices.filter { it.isZram }
+}
 
 data class SwapDevice(
     val path: String,
@@ -18,7 +24,10 @@ data class SwapDevice(
     val sizeBytes: Long,
     val usedBytes: Long,
     val priority: Int?
-)
+) {
+    val isZram: Boolean
+        get() = path.substringAfterLast('/').matches(Regex("zram\\d+"))
+}
 
 data class ZramDevice(
     val name: String,
@@ -52,4 +61,30 @@ data class VmStats(
 data class MemoryPressure(
     val someAvg10: Double?,
     val fullAvg10: Double?
+)
+
+data class ProcessSwapUsage(
+    val pid: Int,
+    val uid: Int,
+    val processName: String,
+    val swapBytes: Long,
+    val swapPssBytes: Long,
+    val rssBytes: Long,
+    val pssBytes: Long
+) {
+    val attributedSwapBytes: Long
+        get() = if (swapPssBytes > 0) swapPssBytes else swapBytes
+}
+
+data class AppSwapUsage(
+    val packageName: String,
+    val label: String,
+    val uid: Int,
+    val attributedSwapBytes: Long,
+    val rawSwapBytes: Long,
+    val residentBytes: Long,
+    val pssBytes: Long,
+    val processCount: Int,
+    val isSystemApp: Boolean,
+    val processes: List<ProcessSwapUsage>
 )
