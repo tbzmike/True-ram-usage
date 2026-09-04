@@ -83,12 +83,12 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun setDisplayMode(mode: DisplayMode) {
+    fun updateDisplayMode(mode: DisplayMode) {
         displayMode = mode
         preferences.displayMode = mode
     }
 
-    fun setThemeMode(mode: ThemeMode) {
+    fun updateThemeMode(mode: ThemeMode) {
         themeMode = mode
         preferences.themeMode = mode
     }
