@@ -32,6 +32,9 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     var appsInZram by mutableStateOf<List<AppSwapUsage>>(emptyList())
         private set
 
+    var appsScanError by mutableStateOf<String?>(null)
+        private set
+
     var rootState by mutableStateOf(RootState.NOT_REQUESTED)
         private set
 
@@ -63,23 +66,16 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
                 delay(2_000)
             }
         }
-        viewModelScope.launch {
-            while (isActive) {
-                if (rootState == RootState.GRANTED) refreshApps()
-                delay(5_000)
-            }
-        }
     }
 
     fun refreshNow() {
         viewModelScope.launch {
             refreshMemory()
-            if (rootState == RootState.GRANTED) refreshApps()
         }
     }
 
     fun refreshAppsNow() {
-        if (rootState != RootState.GRANTED) return
+        if (rootState != RootState.GRANTED || appsScanInProgress) return
         viewModelScope.launch { refreshApps() }
     }
 
@@ -147,13 +143,14 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private suspend fun refreshApps() {
         if (appsScanInProgress || rootState != RootState.GRANTED) return
         appsScanInProgress = true
-        runCatching {
-            withContext(Dispatchers.IO) { appSwapRepository.readAppsUsingSwap() }
-        }.onSuccess {
-            appsInZram = it
-        }.onFailure {
-            actionError = "Per-app ZRAM usage could not be read on this kernel."
+        appsScanError = null
+        try {
+            val apps = withContext(Dispatchers.IO) { appSwapRepository.readAppsUsingSwap() }
+            appsInZram = apps
+        } catch (error: Throwable) {
+            appsScanError = error.message ?: "Per-app ZRAM usage could not be read on this kernel."
+        } finally {
+            appsScanInProgress = false
         }
-        appsScanInProgress = false
     }
 }
