@@ -10,16 +10,13 @@ class AppSwapRepository(
     private val packageManager = context.packageManager
 
     fun readAppsUsingSwap(): List<AppSwapUsage> {
-        if (!rootAccess.isGranted()) return emptyList()
+        check(rootAccess.isGranted()) { "Root access is required for per-app swap attribution." }
+
         val processes = readProcessSwapUsage()
         if (processes.isEmpty()) return emptyList()
 
         return processes
-            .mapNotNull { process ->
-                val packageName = process.processName.substringBefore(':')
-                val appInfo = getApplicationInfo(packageName) ?: return@mapNotNull null
-                ResolvedProcess(process, packageName, appInfo)
-            }
+            .mapNotNull { process -> resolveProcess(process) }
             .groupBy { it.packageName }
             .map { (packageName, resolved) ->
                 val appInfo = resolved.first().appInfo
@@ -42,33 +39,56 @@ class AppSwapRepository(
             .sortedByDescending { it.attributedSwapBytes }
     }
 
+    private fun resolveProcess(process: ProcessSwapUsage): ResolvedProcess? {
+        val commandPackage = process.processName.substringBefore(':')
+        getApplicationInfo(commandPackage)?.let {
+            return ResolvedProcess(process, commandPackage, it)
+        }
+
+        val packagesForUid = runCatching { packageManager.getPackagesForUid(process.uid) }
+            .getOrNull()
+            .orEmpty()
+
+        val packageName = packagesForUid.firstOrNull { candidate ->
+            process.processName == candidate || process.processName.startsWith("$candidate:")
+        } ?: packagesForUid.singleOrNull() ?: return null
+
+        val appInfo = getApplicationInfo(packageName) ?: return null
+        return ResolvedProcess(process, packageName, appInfo)
+    }
+
     @Suppress("DEPRECATION")
     private fun getApplicationInfo(packageName: String): ApplicationInfo? = runCatching {
         packageManager.getApplicationInfo(packageName, 0)
     }.getOrNull()
 
     private fun readProcessSwapUsage(): List<ProcessSwapUsage> {
+        // Fast two-stage scan: /proc/<pid>/status is cheap. smaps_rollup is read only
+        // for processes whose VmSwap is already greater than zero.
         val script = "for p in /proc/[0-9]*; do " +
+            "status=\"\$p/status\"; [ -r \"\$status\" ] || continue; " +
+            "swap=\$(awk '/^VmSwap:/ {print \$2; exit}' \"\$status\" 2>/dev/null); " +
+            "swap=\${swap:-0}; [ \"\$swap\" -gt 0 ] || continue; " +
             "pid=\${p##*/}; " +
-            "[ -r \"\$p/cmdline\" ] || continue; " +
+            "uid=\$(awk '/^Uid:/ {print \$2; exit}' \"\$status\" 2>/dev/null); uid=\${uid:-0}; " +
+            "rss=\$(awk '/^VmRSS:/ {print \$2; exit}' \"\$status\" 2>/dev/null); rss=\${rss:-0}; " +
             "name=\$(tr '\\000' ' ' < \"\$p/cmdline\" 2>/dev/null | awk '{print \$1}'); " +
-            "[ -n \"\$name\" ] || continue; " +
-            "swap=0; swappss=0; rss=0; pss=0; " +
+            "[ -n \"\$name\" ] || name=\$(awk '/^Name:/ {print \$2; exit}' \"\$status\" 2>/dev/null); " +
+            "swappss=0; pss=0; " +
             "if [ -r \"\$p/smaps_rollup\" ]; then " +
-            "vals=\$(awk '/^Swap:/ {s=\$2} /^SwapPss:/ {sp=\$2} /^Rss:/ {r=\$2} /^Pss:/ {ps=\$2} END {printf \"%d %d %d %d\", s, sp, r, ps}' \"\$p/smaps_rollup\" 2>/dev/null); " +
-            "set -- \$vals; swap=\${1:-0}; swappss=\${2:-0}; rss=\${3:-0}; pss=\${4:-0}; " +
-            "else " +
-            "swap=\$(awk '/^VmSwap:/ {print \$2}' \"\$p/status\" 2>/dev/null); " +
-            "rss=\$(awk '/^VmRSS:/ {print \$2}' \"\$p/status\" 2>/dev/null); " +
-            "fi; " +
-            "swap=\${swap:-0}; swappss=\${swappss:-0}; rss=\${rss:-0}; pss=\${pss:-0}; " +
-            "[ \"\$swap\" -gt 0 ] || continue; " +
-            "uid=\$(awk '/^Uid:/ {print \$2}' \"\$p/status\" 2>/dev/null); uid=\${uid:-0}; " +
+            "vals=\$(awk '/^SwapPss:/ {sp=\$2} /^Pss:/ {ps=\$2} END {printf \"%d %d\", sp, ps}' \"\$p/smaps_rollup\" 2>/dev/null); " +
+            "set -- \$vals; swappss=\${1:-0}; pss=\${2:-0}; fi; " +
             "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"\$pid\" \"\$uid\" \"\$swap\" \"\$swappss\" \"\$rss\" \"\$pss\" \"\$name\"; " +
             "done"
 
-        val output = rootAccess.run(script, timeoutSeconds = 20) ?: return emptyList()
-        return output.lineSequence().mapNotNull(::parseProcessLine).toList()
+        val result = rootAccess.runResult(script, timeoutSeconds = 10)
+            ?: error("The root process scanner could not be started.")
+        if (result.timedOut) error("The per-app swap scan timed out.")
+        if (!result.success) error("The kernel process scan failed.")
+
+        return result.output.lineSequence()
+            .mapNotNull(::parseProcessLine)
+            .toList()
     }
 
     private fun parseProcessLine(line: String): ProcessSwapUsage? {
