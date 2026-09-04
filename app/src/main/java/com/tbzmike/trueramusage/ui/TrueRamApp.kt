@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.tbzmike.trueramusage.data.RootState
 import com.tbzmike.trueramusage.data.SwapDevice
 import com.tbzmike.trueramusage.data.ZramDevice
 import java.util.Locale
@@ -38,7 +39,13 @@ fun TrueRamApp(viewModel: MemoryViewModel = viewModel()) {
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text("True RAM Usage", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-                Text("Live memory information translated into plain language.")
+                Text("Accurate memory information translated into plain language.")
+
+                RootCard(
+                    state = viewModel.rootState,
+                    inProgress = viewModel.rootRequestInProgress,
+                    onRequestRoot = viewModel::requestRoot
+                )
 
                 if (snapshot == null) {
                     Text(viewModel.errorMessage ?: "Reading memory information…")
@@ -46,22 +53,47 @@ fun TrueRamApp(viewModel: MemoryViewModel = viewModel()) {
                     return@Column
                 }
 
-                MemoryCard(
+                DetailedMemoryCard(
                     title = "Physical RAM",
                     used = snapshot.usedRamBytes,
                     total = snapshot.totalRamBytes,
-                    description = "Memory currently occupied by Android, apps, caches and the kernel."
+                    available = snapshot.availableRamBytes,
+                    description = "Used is calculated from the kernel's MemTotal minus MemAvailable. MemAvailable is the kernel's estimate of memory that can be given to apps without swapping."
                 )
 
-                MemoryCard(
-                    title = "Swap / ZRAM",
+                SwapSummaryCard(
                     used = snapshot.usedSwapBytes,
                     total = snapshot.totalSwapBytes,
-                    description = "Memory pages moved out of normal RAM into active swap space."
+                    deviceCount = snapshot.swapDevices.size
                 )
 
+                snapshot.vmStats.swappiness?.let { swappiness ->
+                    InfoCard(
+                        "Swap preference",
+                        "Swappiness is $swappiness. Higher values make the kernel more willing to move inactive memory to swap."
+                    )
+                }
+
+                snapshot.pressure?.let { pressure ->
+                    val some = pressure.someAvg10
+                    val full = pressure.fullAvg10
+                    InfoCard(
+                        "Memory pressure",
+                        buildString {
+                            append("Last 10 seconds: ")
+                            append(if (some != null) "some tasks stalled ${formatPsi(some)} of the time" else "partial pressure unavailable")
+                            if (full != null) append(", while all non-idle tasks stalled ${formatPsi(full)} of the time.") else append(".")
+                        }
+                    )
+                }
+
                 if (snapshot.zramDevices.isEmpty()) {
-                    InfoCard("ZRAM", "No readable ZRAM device was detected on this device.")
+                    val text = if (viewModel.rootState == RootState.GRANTED) {
+                        "Root is granted, but no readable ZRAM device was found. The kernel may use a different swap implementation or expose ZRAM differently."
+                    } else {
+                        "Detailed ZRAM statistics are protected on this device. Grant root access above so True RAM Usage can read the kernel's ZRAM statistics directly."
+                    }
+                    InfoCard("ZRAM details", text)
                 } else {
                     snapshot.zramDevices.forEach { ZramCard(it) }
                 }
@@ -80,14 +112,56 @@ fun TrueRamApp(viewModel: MemoryViewModel = viewModel()) {
 }
 
 @Composable
-private fun MemoryCard(title: String, used: Long, total: Long, description: String) {
+private fun RootCard(state: RootState, inProgress: Boolean, onRequestRoot: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Access level", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            when (state) {
+                RootState.GRANTED -> {
+                    Text("Root access granted")
+                    Text("Full kernel-level ZRAM and protected memory statistics are enabled.")
+                }
+                RootState.DENIED_OR_TIMED_OUT -> {
+                    Text("Root access was not granted")
+                    Text("You can retry. Your root manager should show a permission request.")
+                    Button(onClick = onRequestRoot, enabled = !inProgress) { Text(if (inProgress) "Requesting…" else "Retry root access") }
+                }
+                RootState.UNAVAILABLE -> Text("No compatible root command was found on this device.")
+                RootState.NOT_REQUESTED -> {
+                    Text("Standard access")
+                    Text("Basic RAM and swap totals work now. Root is needed for protected ZRAM details and, later, per-app swap attribution.")
+                    Button(onClick = onRequestRoot, enabled = !inProgress) { Text(if (inProgress) "Requesting root…" else "Grant root access") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailedMemoryCard(title: String, used: Long, total: Long, available: Long, description: String) {
     val percent = if (total > 0) (used.toDouble() / total * 100.0).coerceIn(0.0, 100.0) else 0.0
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Text("${formatBytes(used)} of ${formatBytes(total)} used", style = MaterialTheme.typography.headlineSmall)
-            Text("${formatPercent(percent)} used")
+            ValueRow("Used", formatPercent(percent))
+            ValueRow("Available now", formatBytes(available))
+            ValueRow("Kernel-visible total", formatBytes(total))
             Text(description, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun SwapSummaryCard(used: Long, total: Long, deviceCount: Int) {
+    val percent = if (total > 0) (used.toDouble() / total * 100.0).coerceIn(0.0, 100.0) else 0.0
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text("Swap", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text("${formatBytes(used)} of ${formatBytes(total)} used", style = MaterialTheme.typography.headlineSmall)
+            ValueRow("Used", formatPercent(percent))
+            ValueRow("Active swap devices", deviceCount.toString())
+            Text("This is the kernel's active swap total. ZRAM is shown separately below when detailed statistics are readable.")
         }
     }
 }
@@ -97,14 +171,20 @@ private fun ZramCard(device: ZramDevice) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("ZRAM • ${device.name}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            ValueRow("Capacity", formatBytes(device.diskSizeBytes))
-            ValueRow("Data stored", formatBytes(device.originalDataBytes))
-            ValueRow("Physical RAM used", formatBytes(device.memoryUsedBytes))
-            ValueRow("RAM saved by compression", formatBytes(device.savedBytes))
-            ValueRow("Compressed data size", formatBytes(device.compressedDataBytes))
-            device.compressionRatio?.let { ValueRow("Compression efficiency", String.format(Locale.US, "%.2f×", it)) }
-            device.compressionAlgorithm?.let { ValueRow("Compression method", it) }
-            if (device.peakMemoryUsedBytes > 0) ValueRow("Peak physical RAM used", formatBytes(device.peakMemoryUsedBytes))
+            ValueRow("Configured capacity", formatBytes(device.diskSizeBytes))
+            ValueRow("Uncompressed data stored", formatBytes(device.originalDataBytes))
+            ValueRow("Compressed payload", formatBytes(device.compressedDataBytes))
+            ValueRow("Actual RAM allocated", formatBytes(device.memoryUsedBytes))
+            ValueRow("Effective RAM saved", formatBytes(device.ramSavedBytes))
+            device.compressionRatio?.let { ValueRow("Compression ratio", String.format(Locale.US, "%.2f×", it)) }
+            device.effectiveRamRatio?.let { ValueRow("Effective RAM ratio", String.format(Locale.US, "%.2f×", it)) }
+            device.compressionAlgorithm?.let { ValueRow("Compression algorithm", it) }
+            if (device.peakMemoryUsedBytes > 0) ValueRow("Peak RAM allocated", formatBytes(device.peakMemoryUsedBytes))
+            if (device.memoryLimitBytes > 0) ValueRow("ZRAM memory limit", formatBytes(device.memoryLimitBytes))
+            if (device.samePages > 0) ValueRow("Identical pages optimized", formatCount(device.samePages))
+            if (device.compactedPages > 0) ValueRow("Pages freed by compaction", formatCount(device.compactedPages))
+            if (device.hugePages > 0) ValueRow("Poorly compressible huge pages", formatCount(device.hugePages))
+            Text("Compression ratio uses uncompressed data ÷ compressed payload. Effective RAM ratio includes ZRAM allocator overhead, so the two values can differ.")
         }
     }
 }
@@ -117,6 +197,7 @@ private fun SwapCard(device: SwapDevice) {
             ValueRow("Used", "${formatBytes(device.usedBytes)} of ${formatBytes(device.sizeBytes)}")
             ValueRow("Type", device.type)
             device.priority?.let { ValueRow("Priority", it.toString()) }
+            Text(device.path, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -124,7 +205,7 @@ private fun SwapCard(device: SwapDevice) {
 @Composable
 private fun InfoCard(title: String, body: String) {
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(title, fontWeight = FontWeight.Bold)
             Text(body)
         }
@@ -134,7 +215,7 @@ private fun InfoCard(title: String, body: String) {
 @Composable
 private fun ValueRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(label)
+        Text(label, modifier = Modifier.weight(1f))
         Text(value, fontWeight = FontWeight.SemiBold)
     }
 }
@@ -143,10 +224,12 @@ private fun formatBytes(bytes: Long): String {
     val safe = max(0L, bytes)
     val gib = safe / (1024.0 * 1024.0 * 1024.0)
     return if (gib >= 1.0) {
-        String.format(Locale.US, "%.2f GB", gib)
+        String.format(Locale.US, "%.2f GiB", gib)
     } else {
-        String.format(Locale.US, "%.0f MB", safe / (1024.0 * 1024.0))
+        String.format(Locale.US, "%.0f MiB", safe / (1024.0 * 1024.0))
     }
 }
 
-private fun formatPercent(value: Double): String = String.format(Locale.US, "%.0f%%", value)
+private fun formatPercent(value: Double): String = String.format(Locale.US, "%.1f%%", value)
+private fun formatPsi(value: Double): String = String.format(Locale.US, "%.2f%%", value)
+private fun formatCount(value: Long): String = String.format(Locale.US, "%,d", value)
