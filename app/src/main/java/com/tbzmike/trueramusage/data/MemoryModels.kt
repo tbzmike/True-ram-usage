@@ -16,6 +16,9 @@ data class MemorySnapshot(
 
     val activeZramSwapDevices: List<SwapDevice>
         get() = swapDevices.filter { it.isZram }
+
+    val onlyKernelZramActive: Boolean
+        get() = swapDevices.isNotEmpty() && swapDevices.all { it.isZram }
 }
 
 data class SwapDevice(
@@ -77,7 +80,9 @@ data class ProcessSwapUsage(
     val swapBytes: Long,
     val swapPssBytes: Long,
     val rssBytes: Long,
-    val pssBytes: Long
+    val pssBytes: Long,
+    val runningSeconds: Long = 0L,
+    val cpuTimeSeconds: Double = 0.0
 ) {
     val attributedSwapBytes: Long
         get() = swapBytes
@@ -93,5 +98,20 @@ data class AppSwapUsage(
     val pssBytes: Long,
     val processCount: Int,
     val isSystemApp: Boolean,
+    val processes: List<ProcessSwapUsage>,
+    val runningSeconds: Long = 0L,
+    val cpuTimeSeconds: Double = 0.0
+)
+
+data class RunningAppUsage(
+    val packageName: String,
+    val label: String,
+    val uid: Int,
+    val residentBytes: Long,
+    val swapBytes: Long,
+    val processCount: Int,
+    val isSystemApp: Boolean,
+    val runningSeconds: Long,
+    val cpuTimeSeconds: Double,
     val processes: List<ProcessSwapUsage>
 )
