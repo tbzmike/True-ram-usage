@@ -2,7 +2,9 @@ package com.tbzmike.trueramusage.data
 
 import java.io.File
 
-class MemoryRepository {
+class MemoryRepository(
+    private val rootAccess: RootAccess
+) {
     fun readSnapshot(): MemorySnapshot {
         val memInfo = readMemInfo()
         val totalRam = memInfo["MemTotal"] ?: 0L
@@ -20,7 +22,9 @@ class MemoryRepository {
             totalSwapBytes = totalSwap,
             usedSwapBytes = usedSwap,
             swapDevices = readSwapDevices(),
-            zramDevices = readZramDevices()
+            zramDevices = readZramDevices(),
+            vmStats = readVmStats(),
+            pressure = readPressure()
         )
     }
 
@@ -37,8 +41,9 @@ class MemoryRepository {
         }
     }.getOrDefault(emptyMap())
 
-    private fun readSwapDevices(): List<SwapDevice> = runCatching {
-        File("/proc/swaps").readLines()
+    private fun readSwapDevices(): List<SwapDevice> {
+        val text = readText(File("/proc/swaps")) ?: return emptyList()
+        return text.lineSequence()
             .drop(1)
             .mapNotNull { line ->
                 val parts = line.trim().split(Regex("\\s+"))
@@ -51,47 +56,130 @@ class MemoryRepository {
                     priority = parts[4].toIntOrNull()
                 )
             }
-    }.getOrDefault(emptyList())
-
-    private fun readZramDevices(): List<ZramDevice> {
-        val sysBlock = File("/sys/block")
-        val candidates = runCatching {
-            sysBlock.listFiles()
-                ?.filter { it.name.startsWith("zram") }
-                ?.sortedBy { it.name }
-                .orEmpty()
-        }.getOrDefault(emptyList())
-
-        return candidates.mapNotNull { dir -> readZramDevice(dir) }
+            .toList()
     }
 
-    private fun readZramDevice(dir: File): ZramDevice? = runCatching {
-        val mmStat = readLongList(File(dir, "mm_stat"))
-        ZramDevice(
-            name = dir.name,
-            diskSizeBytes = readLong(File(dir, "disksize")),
+    private fun readZramDevices(): List<ZramDevice> {
+        val names = readZramNames()
+        return names.mapNotNull(::readZramDevice)
+    }
+
+    private fun readZramNames(): List<String> {
+        val direct = runCatching {
+            File("/sys/block").listFiles()
+                ?.map { it.name }
+                ?.filter { it.matches(Regex("zram\\d+")) }
+                ?.sorted()
+                .orEmpty()
+        }.getOrDefault(emptyList())
+        if (direct.isNotEmpty()) return direct
+        if (!rootAccess.isGranted()) return emptyList()
+        return rootAccess.run("for d in /sys/block/zram*; do [ -e \"$d\" ] && basename \"$d\"; done")
+            ?.lineSequence()
+            ?.map(String::trim)
+            ?.filter { it.matches(Regex("zram\\d+")) }
+            ?.sorted()
+            ?.toList()
+            .orEmpty()
+    }
+
+    private fun readZramDevice(name: String): ZramDevice? {
+        if (!name.matches(Regex("zram\\d+"))) return null
+        val base = File("/sys/block/$name")
+        val mmText = readText(File(base, "mm_stat"))
+        val diskSizeText = readText(File(base, "disksize"))
+        val algorithmText = readText(File(base, "comp_algorithm"))
+
+        val rootedBundle = if ((mmText == null || diskSizeText == null) && rootAccess.isGranted()) {
+            rootAccess.run(
+                "printf 'DISKSIZE='; cat /sys/block/$name/disksize 2>/dev/null; " +
+                    "printf 'MMSTAT='; cat /sys/block/$name/mm_stat 2>/dev/null; " +
+                    "printf 'ALGO='; cat /sys/block/$name/comp_algorithm 2>/dev/null"
+            )
+        } else null
+
+        val rootedValues = rootedBundle
+            ?.lineSequence()
+            ?.mapNotNull { line ->
+                val idx = line.indexOf('=')
+                if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1).trim()
+            }
+            ?.toMap()
+            .orEmpty()
+
+        val mmStat = parseLongList(mmText ?: rootedValues["MMSTAT"])
+        if (mmStat.size < 3) return null
+
+        return ZramDevice(
+            name = name,
+            diskSizeBytes = (diskSizeText ?: rootedValues["DISKSIZE"])?.trim()?.toLongOrNull() ?: 0L,
             originalDataBytes = mmStat.getOrElse(0) { 0L },
             compressedDataBytes = mmStat.getOrElse(1) { 0L },
             memoryUsedBytes = mmStat.getOrElse(2) { 0L },
             memoryLimitBytes = mmStat.getOrElse(3) { 0L },
             peakMemoryUsedBytes = mmStat.getOrElse(4) { 0L },
             samePages = mmStat.getOrElse(5) { 0L },
-            compactedPages = mmStat.getOrElse(7) { 0L },
-            compressionAlgorithm = readActiveAlgorithm(File(dir, "comp_algorithm"))
+            compactedPages = mmStat.getOrElse(6) { 0L },
+            hugePages = mmStat.getOrElse(7) { 0L },
+            compressionAlgorithm = readActiveAlgorithm(algorithmText ?: rootedValues["ALGO"])
         )
+    }
+
+    private fun readVmStats(): VmStats {
+        val swappiness = readText(File("/proc/sys/vm/swappiness"))
+            ?.trim()
+            ?.toIntOrNull()
+            ?: rootAccess.run("cat /proc/sys/vm/swappiness 2>/dev/null")?.trim()?.toIntOrNull()
+
+        val vmText = readText(File("/proc/vmstat"))
+            ?: rootAccess.run("cat /proc/vmstat 2>/dev/null")
+        val vm = vmText
+            ?.lineSequence()
+            ?.mapNotNull { line ->
+                val parts = line.trim().split(Regex("\\s+"), limit = 2)
+                if (parts.size == 2) parts[0] to parts[1].toLongOrNull() else null
+            }
+            ?.filter { it.second != null }
+            ?.associate { it.first to it.second!! }
+            .orEmpty()
+
+        return VmStats(
+            swappiness = swappiness,
+            swapInPages = vm["pswpin"],
+            swapOutPages = vm["pswpout"]
+        )
+    }
+
+    private fun readPressure(): MemoryPressure? {
+        val text = readText(File("/proc/pressure/memory"))
+            ?: rootAccess.run("cat /proc/pressure/memory 2>/dev/null")
+            ?: return null
+        fun avg10(prefix: String): Double? = text.lineSequence()
+            .firstOrNull { it.startsWith(prefix) }
+            ?.split(Regex("\\s+"))
+            ?.firstOrNull { it.startsWith("avg10=") }
+            ?.substringAfter('=')
+            ?.toDoubleOrNull()
+        return MemoryPressure(
+            someAvg10 = avg10("some "),
+            fullAvg10 = avg10("full ")
+        )
+    }
+
+    private fun readText(file: File): String? = runCatching {
+        file.readText().trim()
     }.getOrNull()
 
-    private fun readLong(file: File): Long = runCatching {
-        file.readText().trim().toLong()
-    }.getOrDefault(0L)
+    private fun parseLongList(text: String?): List<Long> = text
+        ?.trim()
+        ?.split(Regex("\\s+"))
+        ?.mapNotNull(String::toLongOrNull)
+        .orEmpty()
 
-    private fun readLongList(file: File): List<Long> = runCatching {
-        file.readText().trim().split(Regex("\\s+")).mapNotNull(String::toLongOrNull)
-    }.getOrDefault(emptyList())
-
-    private fun readActiveAlgorithm(file: File): String? = runCatching {
-        val text = file.readText().trim()
-        Regex("\\[([^]]+)]").find(text)?.groupValues?.getOrNull(1)
-            ?: text.split(Regex("\\s+")).firstOrNull()
-    }.getOrNull()
+    private fun readActiveAlgorithm(text: String?): String? {
+        val clean = text?.trim().orEmpty()
+        if (clean.isEmpty()) return null
+        return Regex("\\[([^]]+)]").find(clean)?.groupValues?.getOrNull(1)
+            ?: clean.split(Regex("\\s+")).firstOrNull()
+    }
 }
