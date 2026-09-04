@@ -15,8 +15,12 @@ class AppSwapRepository(
         val processes = readProcessSwapUsage()
         if (processes.isEmpty()) return emptyList()
 
+        val packagesByUid = mutableMapOf<Int, List<String>>()
+
         return processes
-            .mapNotNull { process -> resolveProcess(process) }
+            .mapNotNull { process ->
+                resolveProcess(process, packagesByUid)
+            }
             .groupBy { it.packageName }
             .map { (packageName, resolved) ->
                 val appInfo = resolved.first().appInfo
@@ -26,32 +30,36 @@ class AppSwapRepository(
                     label = runCatching { appInfo.loadLabel(packageManager).toString() }
                         .getOrDefault(packageName),
                     uid = appInfo.uid,
-                    attributedSwapBytes = processList.sumOf { it.attributedSwapBytes },
+                    attributedSwapBytes = processList.sumOf { it.swapBytes },
                     rawSwapBytes = processList.sumOf { it.swapBytes },
                     residentBytes = processList.sumOf { it.rssBytes },
-                    pssBytes = processList.sumOf { it.pssBytes },
+                    pssBytes = 0L,
                     processCount = processList.size,
                     isSystemApp = appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0,
-                    processes = processList.sortedByDescending { it.attributedSwapBytes }
+                    processes = processList.sortedByDescending { it.swapBytes }
                 )
             }
             .filter { it.attributedSwapBytes > 0 }
             .sortedByDescending { it.attributedSwapBytes }
     }
 
-    private fun resolveProcess(process: ProcessSwapUsage): ResolvedProcess? {
-        val commandPackage = process.processName.substringBefore(':')
-        getApplicationInfo(commandPackage)?.let {
-            return ResolvedProcess(process, commandPackage, it)
+    private fun resolveProcess(
+        process: ProcessSwapUsage,
+        packagesByUid: MutableMap<Int, List<String>>
+    ): ResolvedProcess? {
+        val packages = packagesByUid.getOrPut(process.uid) {
+            runCatching { packageManager.getPackagesForUid(process.uid)?.toList().orEmpty() }
+                .getOrDefault(emptyList())
         }
+        if (packages.isEmpty()) return null
 
-        val packagesForUid = runCatching { packageManager.getPackagesForUid(process.uid) }
-            .getOrNull()
-            .orEmpty()
-
-        val packageName = packagesForUid.firstOrNull { candidate ->
-            process.processName == candidate || process.processName.startsWith("$candidate:")
-        } ?: packagesForUid.singleOrNull() ?: return null
+        val packageName = when {
+            packages.size == 1 -> packages.single()
+            process.processName.isNotBlank() -> packages.firstOrNull { candidate ->
+                process.processName == candidate || process.processName.startsWith("$candidate:")
+            }
+            else -> null
+        } ?: return null
 
         val appInfo = getApplicationInfo(packageName) ?: return null
         return ResolvedProcess(process, packageName, appInfo)
@@ -63,55 +71,111 @@ class AppSwapRepository(
     }.getOrNull()
 
     private fun readProcessSwapUsage(): List<ProcessSwapUsage> {
-        // Fast two-stage scan: /proc/<pid>/status is cheap. smaps_rollup is read only
-        // for processes whose VmSwap is already greater than zero.
-        val script = "for p in /proc/[0-9]*; do " +
-            "status=\"\$p/status\"; [ -r \"\$status\" ] || continue; " +
-            "swap=\$(awk '/^VmSwap:/ {print \$2; exit}' \"\$status\" 2>/dev/null); " +
-            "swap=\${swap:-0}; [ \"\$swap\" -gt 0 ] || continue; " +
-            "pid=\${p##*/}; " +
-            "uid=\$(awk '/^Uid:/ {print \$2; exit}' \"\$status\" 2>/dev/null); uid=\${uid:-0}; " +
-            "rss=\$(awk '/^VmRSS:/ {print \$2; exit}' \"\$status\" 2>/dev/null); rss=\${rss:-0}; " +
-            "name=\$(tr '\\000' ' ' < \"\$p/cmdline\" 2>/dev/null | awk '{print \$1}'); " +
-            "[ -n \"\$name\" ] || name=\$(awk '/^Name:/ {print \$2; exit}' \"\$status\" 2>/dev/null); " +
-            "swappss=0; pss=0; " +
-            "if [ -r \"\$p/smaps_rollup\" ]; then " +
-            "vals=\$(awk '/^SwapPss:/ {sp=\$2} /^Pss:/ {ps=\$2} END {printf \"%d %d\", sp, ps}' \"\$p/smaps_rollup\" 2>/dev/null); " +
-            "set -- \$vals; swappss=\${1:-0}; pss=\${2:-0}; fi; " +
-            "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"\$pid\" \"\$uid\" \"\$swap\" \"\$swappss\" \"\$rss\" \"\$pss\" \"\$name\"; " +
-            "done"
+        // First pass: one grep process reads only the inexpensive status fields for
+        // every PID. smaps/smaps_rollup are deliberately not touched here because
+        // they can take many seconds on phones with many mappings.
+        val statusResult = rootAccess.runResult(
+            "grep -H -E '^(Uid|VmRSS|VmSwap):' /proc/[0-9]*/status 2>/dev/null || true",
+            timeoutSeconds = 5
+        ) ?: error("The root process scanner could not be started.")
 
-        val result = rootAccess.runResult(script, timeoutSeconds = 10)
-            ?: error("The root process scanner could not be started.")
-        if (result.timedOut) error("The per-app swap scan timed out.")
-        if (!result.success) error("The kernel process scan failed.")
+        if (statusResult.timedOut) {
+            error("The fast per-app swap scan timed out while reading /proc status files.")
+        }
+        if (!statusResult.success) {
+            error("The kernel process status scan failed.")
+        }
+
+        val rawProcesses = parseStatusOutput(statusResult.output)
+            .filter { it.swapKb > 0L }
+
+        if (rawProcesses.isEmpty()) return emptyList()
+
+        val names = readProcessNames(rawProcesses.map { it.pid })
+
+        return rawProcesses.map { raw ->
+            ProcessSwapUsage(
+                pid = raw.pid,
+                uid = raw.uid,
+                processName = names[raw.pid].orEmpty(),
+                swapBytes = raw.swapKb * 1024L,
+                swapPssBytes = 0L,
+                rssBytes = raw.rssKb * 1024L,
+                pssBytes = 0L
+            )
+        }
+    }
+
+    private fun parseStatusOutput(output: String): List<RawProcessStatus> {
+        val linePattern = Regex("^/proc/(\\d+)/status:(Uid|VmRSS|VmSwap):\\s+(.+)$")
+        val byPid = linkedMapOf<Int, MutableProcessStatus>()
+
+        output.lineSequence().forEach { line ->
+            val match = linePattern.matchEntire(line.trim()) ?: return@forEach
+            val pid = match.groupValues[1].toIntOrNull() ?: return@forEach
+            val field = match.groupValues[2]
+            val firstNumber = match.groupValues[3]
+                .trim()
+                .substringBefore(' ')
+                .toLongOrNull()
+                ?: return@forEach
+
+            val current = byPid.getOrPut(pid) { MutableProcessStatus() }
+            when (field) {
+                "Uid" -> current.uid = firstNumber.toInt()
+                "VmRSS" -> current.rssKb = firstNumber
+                "VmSwap" -> current.swapKb = firstNumber
+            }
+        }
+
+        return byPid.mapNotNull { (pid, fields) ->
+            val uid = fields.uid ?: return@mapNotNull null
+            RawProcessStatus(
+                pid = pid,
+                uid = uid,
+                swapKb = fields.swapKb,
+                rssKb = fields.rssKb
+            )
+        }
+    }
+
+    private fun readProcessNames(pids: List<Int>): Map<Int, String> {
+        if (pids.isEmpty()) return emptyMap()
+
+        val pidList = pids.joinToString(" ")
+        val dollar = '$'
+        val script =
+            "for pid in $pidList; do " +
+                "[ -r /proc/${dollar}pid/cmdline ] || continue; " +
+                "name=\$(tr '\\000' ' ' < /proc/${dollar}pid/cmdline 2>/dev/null | cut -d' ' -f1); " +
+                "printf '%s\\t%s\\n' \"${dollar}pid\" \"${dollar}name\"; " +
+                "done"
+
+        val result = rootAccess.runResult(script, timeoutSeconds = 3) ?: return emptyMap()
+        if (!result.success) return emptyMap()
 
         return result.output.lineSequence()
-            .mapNotNull(::parseProcessLine)
-            .toList()
+            .mapNotNull { line ->
+                val parts = line.split('\t', limit = 2)
+                if (parts.size != 2) return@mapNotNull null
+                val pid = parts[0].toIntOrNull() ?: return@mapNotNull null
+                pid to parts[1].trim()
+            }
+            .toMap()
     }
 
-    private fun parseProcessLine(line: String): ProcessSwapUsage? {
-        val parts = line.split('\t', limit = 7)
-        if (parts.size != 7) return null
-        val pid = parts[0].toIntOrNull() ?: return null
-        val uid = parts[1].toIntOrNull() ?: return null
-        val swapKb = parts[2].toLongOrNull() ?: return null
-        val swapPssKb = parts[3].toLongOrNull() ?: 0L
-        val rssKb = parts[4].toLongOrNull() ?: 0L
-        val pssKb = parts[5].toLongOrNull() ?: 0L
-        val name = parts[6].trim()
-        if (name.isEmpty()) return null
-        return ProcessSwapUsage(
-            pid = pid,
-            uid = uid,
-            processName = name,
-            swapBytes = swapKb * 1024L,
-            swapPssBytes = swapPssKb * 1024L,
-            rssBytes = rssKb * 1024L,
-            pssBytes = pssKb * 1024L
-        )
-    }
+    private data class MutableProcessStatus(
+        var uid: Int? = null,
+        var swapKb: Long = 0L,
+        var rssKb: Long = 0L
+    )
+
+    private data class RawProcessStatus(
+        val pid: Int,
+        val uid: Int,
+        val swapKb: Long,
+        val rssKb: Long
+    )
 
     private data class ResolvedProcess(
         val process: ProcessSwapUsage,

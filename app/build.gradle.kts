@@ -11,8 +11,17 @@ android {
         applicationId = "com.tbzmike.trueramusage"
         minSdk = 26
         targetSdk = 37
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.3.2"
+    }
+
+    signingConfigs {
+        create("development") {
+            storeFile = file("true-ram-usage-dev.keystore")
+            storePassword = "android"
+            keyAlias = "true-ram-usage-dev"
+            keyPassword = "android"
+        }
     }
 
     buildFeatures {
@@ -20,6 +29,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("development")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

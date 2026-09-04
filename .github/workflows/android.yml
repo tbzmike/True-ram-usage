@@ -27,6 +27,16 @@ jobs:
       - name: Assemble debug APK
         run: gradle :app:assembleDebug --stacktrace
 
+      - name: Verify fixed development signature
+        shell: bash
+        run: |
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$APKSIGNER"
+          CERT_SHA256="$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_SHA256="1a3d8693351e6536fba6c900526850a878a0827bc1aa806ced994ec4b9da36ec"
+          echo "APK signing SHA-256: $CERT_SHA256"
+          test "$CERT_SHA256" = "$EXPECTED_SHA256"
+
       - name: Upload debug APK
         if: success()
         uses: actions/upload-artifact@v4

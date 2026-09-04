@@ -26,7 +26,14 @@ data class SwapDevice(
     val priority: Int?
 ) {
     val isZram: Boolean
-        get() = path.substringAfterLast('/').matches(Regex("zram\\d+"))
+        get() {
+            val normalized = path.lowercase()
+            val fileName = normalized.substringAfterLast('/')
+                .substringBefore('(')
+                .trim()
+            return fileName.matches(Regex("zram\\d+")) ||
+                Regex("(^|/)zram\\d+($|/)").containsMatchIn(normalized)
+        }
 }
 
 data class ZramDevice(
@@ -73,7 +80,7 @@ data class ProcessSwapUsage(
     val pssBytes: Long
 ) {
     val attributedSwapBytes: Long
-        get() = if (swapPssBytes > 0) swapPssBytes else swapBytes
+        get() = swapBytes
 }
 
 data class AppSwapUsage(

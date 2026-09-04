@@ -1,5 +1,6 @@
 package com.tbzmike.trueramusage.data
 
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 enum class RootState {
@@ -46,18 +47,39 @@ class RootAccess {
         val process = ProcessBuilder("su", "-c", command)
             .redirectErrorStream(true)
             .start()
-        if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-            process.destroyForcibly()
-            return@runCatching RootCommandResult(
-                exitCode = null,
-                output = "",
-                timedOut = true
-            )
+
+        // Read stdout concurrently. Waiting for the process before draining stdout can
+        // deadlock when a command produces enough output to fill the OS pipe buffer.
+        val executor = Executors.newSingleThreadExecutor()
+        val outputFuture = executor.submit<String> {
+            process.inputStream.bufferedReader().use { it.readText() }
         }
-        RootCommandResult(
-            exitCode = process.exitValue(),
-            output = process.inputStream.bufferedReader().use { it.readText() }.trim(),
-            timedOut = false
-        )
+
+        try {
+            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                process.destroy()
+                if (!process.waitFor(300, TimeUnit.MILLISECONDS)) {
+                    process.destroyForcibly()
+                }
+                outputFuture.cancel(true)
+                return@runCatching RootCommandResult(
+                    exitCode = null,
+                    output = "",
+                    timedOut = true
+                )
+            }
+
+            val output = runCatching {
+                outputFuture.get(2, TimeUnit.SECONDS)
+            }.getOrDefault("")
+
+            RootCommandResult(
+                exitCode = process.exitValue(),
+                output = output.trim(),
+                timedOut = false
+            )
+        } finally {
+            executor.shutdownNow()
+        }
     }.getOrNull()
 }

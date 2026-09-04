@@ -269,9 +269,9 @@ private fun AppsInZramSection(
     )
 
     when {
-        scanning -> InfoCard("Scanning apps", "Checking only processes that currently have swapped pages…")
+        scanning -> InfoCard("Scanning apps", "Reading lightweight per-process swap counters…")
         scanError != null -> InfoCard("App scan failed", scanError)
-        apps.isEmpty() -> InfoCard("No app pages found", "No installed app currently has readable swapped pages.")
+        apps.isEmpty() -> InfoCard("No app pages found", "No installed app currently has readable private swapped pages.")
         else -> {
             val attributed = apps.sumOf { it.attributedSwapBytes }
             Text("${formatBytes(attributed)} attributed to installed apps")
@@ -290,9 +290,9 @@ private fun AppsInZramSection(
     CollapsibleInfoCard(
         title = "How app ZRAM usage is measured",
         body = if (onlyKernelZram) {
-            "Only ZRAM is active as swap. The app first finds processes with non-zero VmSwap, then reads SwapPss when available so shared swapped pages are attributed more accurately."
+            "Only ZRAM is active as swap. The app reads each process's VmSwap counter from /proc/<pid>/status. This is fast and directly reports that process's private anonymous memory currently swapped into ZRAM. Shared tmpfs/shmem swap is not counted in an individual app figure."
         } else {
-            "More than one swap type is active, so per-process swapped pages cannot be attributed specifically to ZRAM."
+            "More than one swap type is active, so a process's VmSwap value cannot be attributed specifically to ZRAM."
         }
     )
 }
@@ -303,8 +303,7 @@ private fun AppSwapCard(app: AppSwapUsage, actionInProgress: Boolean, onClose: (
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(app.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             ValueRow("In ZRAM / swap", formatBytes(app.attributedSwapBytes))
-            val resident = if (app.pssBytes > 0) app.pssBytes else app.residentBytes
-            ValueRow("Still in RAM", formatBytes(resident))
+            ValueRow("Still in RAM", formatBytes(app.residentBytes))
             if (app.processCount > 1) ValueRow("Processes", app.processCount.toString())
             if (app.isSystemApp) {
                 Text("System app — protected", style = MaterialTheme.typography.bodySmall)
