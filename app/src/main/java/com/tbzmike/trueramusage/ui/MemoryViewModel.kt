@@ -6,13 +6,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.tbzmike.trueramusage.data.AppPreferences
 import com.tbzmike.trueramusage.data.AppSwapRepository
 import com.tbzmike.trueramusage.data.AppSwapUsage
+import com.tbzmike.trueramusage.data.DisplayMode
 import com.tbzmike.trueramusage.data.MemoryActions
 import com.tbzmike.trueramusage.data.MemoryRepository
 import com.tbzmike.trueramusage.data.MemorySnapshot
 import com.tbzmike.trueramusage.data.RootAccess
 import com.tbzmike.trueramusage.data.RootState
+import com.tbzmike.trueramusage.data.RunningAppUsage
+import com.tbzmike.trueramusage.data.ThemeMode
 import com.tbzmike.trueramusage.data.ZramClearSafety
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -25,11 +29,16 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private val repository = MemoryRepository(rootAccess)
     private val appSwapRepository = AppSwapRepository(application, rootAccess)
     private val memoryActions = MemoryActions(rootAccess)
+    private val preferences = AppPreferences(application)
+    private val ownPackageName = application.packageName
 
     var snapshot by mutableStateOf<MemorySnapshot?>(null)
         private set
 
     var appsInZram by mutableStateOf<List<AppSwapUsage>>(emptyList())
+        private set
+
+    var runningApps by mutableStateOf<List<RunningAppUsage>>(emptyList())
         private set
 
     var appsScanError by mutableStateOf<String?>(null)
@@ -59,6 +68,12 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
+    var displayMode by mutableStateOf(preferences.displayMode)
+        private set
+
+    var themeMode by mutableStateOf(preferences.themeMode)
+        private set
+
     init {
         viewModelScope.launch {
             while (isActive) {
@@ -68,10 +83,18 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun setDisplayMode(mode: DisplayMode) {
+        displayMode = mode
+        preferences.displayMode = mode
+    }
+
+    fun setThemeMode(mode: ThemeMode) {
+        themeMode = mode
+        preferences.themeMode = mode
+    }
+
     fun refreshNow() {
-        viewModelScope.launch {
-            refreshMemory()
-        }
+        viewModelScope.launch { refreshMemory() }
     }
 
     fun refreshAppsNow() {
@@ -100,6 +123,22 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
             }
             if (result.success) actionMessage = result.message else actionError = result.message
             delay(700)
+            refreshMemory()
+            refreshApps()
+            actionInProgress = false
+        }
+    }
+
+    fun closeAllAppsInZram() {
+        if (actionInProgress || appsInZram.isEmpty()) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            val result = withContext(Dispatchers.IO) {
+                memoryActions.closeAllAppsInZram(appsInZram, ownPackageName)
+            }
+            if (result.success) actionMessage = result.message else actionError = result.message
+            delay(900)
             refreshMemory()
             refreshApps()
             actionInProgress = false
@@ -145,12 +184,31 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         appsScanInProgress = true
         appsScanError = null
         try {
-            val apps = withContext(Dispatchers.IO) { appSwapRepository.readAppsUsingSwap() }
-            appsInZram = apps
+            val running = withContext(Dispatchers.IO) { appSwapRepository.readRunningApps() }
+            runningApps = running
+            appsInZram = running
+                .filter { it.swapBytes > 0L }
+                .map { it.toAppSwapUsage() }
+                .sortedByDescending { it.attributedSwapBytes }
         } catch (error: Throwable) {
-            appsScanError = error.message ?: "Per-app ZRAM usage could not be read on this kernel."
+            appsScanError = error.message ?: "Running-app memory information could not be read on this kernel."
         } finally {
             appsScanInProgress = false
         }
     }
+
+    private fun RunningAppUsage.toAppSwapUsage() = AppSwapUsage(
+        packageName = packageName,
+        label = label,
+        uid = uid,
+        attributedSwapBytes = swapBytes,
+        rawSwapBytes = swapBytes,
+        residentBytes = residentBytes,
+        pssBytes = 0L,
+        processCount = processCount,
+        isSystemApp = isSystemApp,
+        processes = processes,
+        runningSeconds = runningSeconds,
+        cpuTimeSeconds = cpuTimeSeconds
+    )
 }
