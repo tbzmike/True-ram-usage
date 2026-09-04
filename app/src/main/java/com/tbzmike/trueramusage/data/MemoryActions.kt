@@ -74,14 +74,15 @@ class MemoryActions(
             return MemoryActionResult(false, "One or more package names could not be validated safely.")
         }
 
+        val dollar = '$'
         val command = buildString {
             append("failed=0; closed=0; ")
             targets.forEach { packageName ->
                 append("if am force-stop --user current ")
                 append(shellQuote(packageName))
-                append(" >/dev/null 2>&1; then closed=$((closed+1)); else failed=$((failed+1)); fi; ")
+                append(" >/dev/null 2>&1; then closed=${dollar}((closed+1)); else failed=${dollar}((failed+1)); fi; ")
             }
-            append("printf 'CLOSED=%s FAILED=%s\\n' \"$closed\" \"$failed\"")
+            append("printf 'CLOSED=%s FAILED=%s\\n' \"${dollar}closed\" \"${dollar}failed\"")
         }
 
         val result = rootAccess.runResult(command, timeoutSeconds = 45)
