@@ -24,7 +24,24 @@ class MemoryRepository(
             swapDevices = readSwapDevices(),
             zramDevices = readZramDevices(),
             vmStats = readVmStats(),
-            pressure = readPressure()
+            pressure = readPressure(),
+            breakdown = SystemMemoryBreakdown(
+                freeBytes = memInfo["MemFree"] ?: 0L,
+                buffersBytes = memInfo["Buffers"] ?: 0L,
+                cachedBytes = memInfo["Cached"] ?: 0L,
+                swapCachedBytes = memInfo["SwapCached"] ?: 0L,
+                anonymousBytes = memInfo["AnonPages"] ?: 0L,
+                shmemBytes = memInfo["Shmem"] ?: 0L,
+                slabBytes = memInfo["Slab"] ?: 0L,
+                reclaimableSlabBytes = memInfo["SReclaimable"] ?: 0L,
+                unreclaimableSlabBytes = memInfo["SUnreclaim"] ?: 0L,
+                kernelStackBytes = memInfo["KernelStack"] ?: 0L,
+                pageTablesBytes = memInfo["PageTables"] ?: 0L,
+                unevictableBytes = memInfo["Unevictable"] ?: 0L,
+                mlockedBytes = memInfo["Mlocked"] ?: 0L,
+                dirtyBytes = memInfo["Dirty"] ?: 0L,
+                writebackBytes = memInfo["Writeback"] ?: 0L
+            )
         )
     }
 
