@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.tbzmike.trueramusage.data.AggressiveAppReclaimer
 import com.tbzmike.trueramusage.data.AppPreferences
 import com.tbzmike.trueramusage.data.AppSwapRepository
 import com.tbzmike.trueramusage.data.AppSwapUsage
@@ -36,6 +37,11 @@ data class AggressiveReclaimReport(
     val beforeSwapUsedBytes: Long,
     val afterSwapUsedBytes: Long,
     val userAppCloseMessage: String,
+    val userAppsTargeted: Int,
+    val failedForceStopCommands: Int,
+    val killAllPassesSucceeded: Int,
+    val appSweepRepeated: Boolean,
+    val remainingMappedUserApps: Int?,
     val kernelReclaimMessage: String,
     val swapMessage: String,
     val swapPasses: Int,
@@ -61,6 +67,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private val repository = MemoryRepository(rootAccess)
     private val appSwapRepository = AppSwapRepository(application, rootAccess)
     private val memoryActions = MemoryActions(rootAccess)
+    private val aggressiveAppReclaimer = AggressiveAppReclaimer(rootAccess)
     private val preferences = AppPreferences(application)
     private val updatePreferences = UpdatePreferences(application)
     private val ownPackageName = application.packageName
@@ -285,17 +292,20 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
                 aggressiveReclaimStage = "Capturing before-state memory readings…"
                 val before = withContext(Dispatchers.IO) { repository.readSnapshot() }
 
-                aggressiveReclaimStage = "Scanning current processes before closing user apps…"
+                aggressiveReclaimStage = "Scanning current processes before the exhaustive app sweep…"
                 val freshScan = withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
                 applyProcessScan(freshScan)
 
-                aggressiveReclaimStage = "Force-stopping current non-system user apps…"
-                val closeResult = withContext(Dispatchers.IO) {
-                    memoryActions.closeAllUserApps(freshScan.apps, ownPackageName)
+                aggressiveReclaimStage = "Enumerating and force-stopping every installed third-party app…"
+                val firstAppSweep = withContext(Dispatchers.IO) {
+                    aggressiveAppReclaimer.forceStopAllKillableUserApps(freshScan.apps, ownPackageName)
+                }
+                if (firstAppSweep.currentUserId == null) {
+                    throw IllegalStateException(firstAppSweep.message)
                 }
 
-                delay(400)
-                aggressiveReclaimStage = "Killing remaining background processes, dropping clean caches and compacting memory…"
+                delay(700)
+                aggressiveReclaimStage = "Killing remaining Android-background processes, dropping clean caches and compacting memory…"
                 val kernelResult = withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
 
                 delay(800)
@@ -332,10 +342,35 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 aggressiveReclaimStage = "Performing final background/cache reclaim after swap cycling…"
-                withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
+                val finalKernelResult = withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
                 delay(700)
 
-                aggressiveReclaimStage = "Verifying final physical RAM and swap state…"
+                aggressiveReclaimStage = "Checking whether any user apps restarted during reclaim…"
+                val preFinalScan = runCatching {
+                    withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
+                }.getOrNull()
+                val restartedUserApps = preFinalScan?.apps.orEmpty().filter {
+                    !it.isSystemApp && it.packageName != ownPackageName
+                }
+
+                var repeatedSweep = false
+                var retryMessage: String? = null
+                var retryFailedCommands = 0
+                var retryKillPasses = 0
+                if (restartedUserApps.isNotEmpty()) {
+                    repeatedSweep = true
+                    aggressiveReclaimStage = "${restartedUserApps.size} user app(s) restarted; force-stopping the complete user-app set again…"
+                    val retrySweep = withContext(Dispatchers.IO) {
+                        aggressiveAppReclaimer.forceStopAllKillableUserApps(preFinalScan?.apps.orEmpty(), ownPackageName)
+                    }
+                    retryMessage = retrySweep.message
+                    retryFailedCommands = retrySweep.failedForceStopCommands
+                    retryKillPasses = retrySweep.killAllPassesSucceeded
+                    withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
+                    delay(700)
+                }
+
+                aggressiveReclaimStage = "Verifying final physical RAM, swap and surviving mapped user apps…"
                 val after = withContext(Dispatchers.IO) { repository.readSnapshot() }
                 snapshot = after
                 zramClearSafety = memoryActions.getClearSafety(after)
@@ -345,6 +380,18 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
                     withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
                 }.getOrNull()
                 if (afterScan != null) applyProcessScan(afterScan)
+                val remainingMappedUserApps = afterScan?.apps?.count {
+                    !it.isSystemApp && it.packageName != ownPackageName
+                }
+
+                val appSweepMessage = buildString {
+                    append(firstAppSweep.message)
+                    if (retryMessage != null) append(" Restart cleanup: $retryMessage")
+                    if (remainingMappedUserApps != null) {
+                        append(" Final mapped non-system app processes still visible: $remainingMappedUserApps.")
+                    }
+                }
+                val kernelMessage = "Initial kernel pass: ${kernelResult.message} Final kernel pass: ${finalKernelResult.message}"
 
                 aggressiveReclaimReport = AggressiveReclaimReport(
                     beforeUsedRamBytes = before.usedRamBytes,
@@ -353,15 +400,20 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
                     afterAvailableRamBytes = after.availableRamBytes,
                     beforeSwapUsedBytes = before.usedSwapBytes,
                     afterSwapUsedBytes = after.usedSwapBytes,
-                    userAppCloseMessage = closeResult.message,
-                    kernelReclaimMessage = kernelResult.message,
+                    userAppCloseMessage = appSweepMessage,
+                    userAppsTargeted = firstAppSweep.targetedPackages,
+                    failedForceStopCommands = firstAppSweep.failedForceStopCommands + retryFailedCommands,
+                    killAllPassesSucceeded = firstAppSweep.killAllPassesSucceeded + retryKillPasses,
+                    appSweepRepeated = repeatedSweep,
+                    remainingMappedUserApps = remainingMappedUserApps,
+                    kernelReclaimMessage = kernelMessage,
                     swapMessage = swapMessage,
                     swapPasses = swapPasses,
                     swapClearBlockedBytes = if (swapPasses == 0 && current.swapDevices.isNotEmpty() && !safety.canClear) safety.additionalNeededBytes else 0L,
                     allSwapWasDisabledAtOnce = allSwapWasDisabledAtOnce,
                     swappinessRestored = swappinessRestored
                 )
-                actionMessage = "Aggressive boot-like reclaim completed and final kernel readings were verified."
+                actionMessage = "Aggressive reclaim completed. User-app force-stop, kernel reclaim and final RAM/swap readings were verified."
             } catch (error: Throwable) {
                 actionError = error.message ?: "Aggressive reclaim failed before final verification."
                 runCatching { refreshMemory() }
