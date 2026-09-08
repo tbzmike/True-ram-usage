@@ -20,6 +20,7 @@ import com.tbzmike.trueramusage.data.ThemeMode
 import com.tbzmike.trueramusage.data.UnmappedProcessUsage
 import com.tbzmike.trueramusage.data.ZramClearSafety
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -32,6 +33,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private val memoryActions = MemoryActions(rootAccess)
     private val preferences = AppPreferences(application)
     private val ownPackageName = application.packageName
+    private var monitoringJob: Job? = null
 
     var snapshot by mutableStateOf<MemorySnapshot?>(null)
         private set
@@ -80,12 +82,18 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     val themeMode: ThemeMode
         get() = themeModeState
 
-    init {
-        viewModelScope.launch {
-            while (isActive) {
-                refreshMemory()
-                delay(2_000)
+    fun setMonitoringActive(active: Boolean) {
+        if (active) {
+            if (monitoringJob?.isActive == true) return
+            monitoringJob = viewModelScope.launch {
+                while (isActive) {
+                    refreshMemory()
+                    delay(2_000)
+                }
             }
+        } else {
+            monitoringJob?.cancel()
+            monitoringJob = null
         }
     }
 
