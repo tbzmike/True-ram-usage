@@ -13,6 +13,7 @@ import com.tbzmike.trueramusage.data.DisplayMode
 import com.tbzmike.trueramusage.data.MemoryActions
 import com.tbzmike.trueramusage.data.MemoryRepository
 import com.tbzmike.trueramusage.data.MemorySnapshot
+import com.tbzmike.trueramusage.data.ProcessScanResult
 import com.tbzmike.trueramusage.data.RootAccess
 import com.tbzmike.trueramusage.data.RootState
 import com.tbzmike.trueramusage.data.RunningAppUsage
@@ -26,6 +27,34 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+data class AggressiveReclaimReport(
+    val beforeUsedRamBytes: Long,
+    val afterUsedRamBytes: Long,
+    val beforeAvailableRamBytes: Long,
+    val afterAvailableRamBytes: Long,
+    val beforeSwapUsedBytes: Long,
+    val afterSwapUsedBytes: Long,
+    val userAppCloseMessage: String,
+    val kernelReclaimMessage: String,
+    val swapMessage: String,
+    val swapPasses: Int,
+    val swapClearBlockedBytes: Long,
+    val allSwapWasDisabledAtOnce: Boolean,
+    val swappinessRestored: Boolean
+) {
+    val reclaimedRamBytes: Long
+        get() = (beforeUsedRamBytes - afterUsedRamBytes).coerceAtLeast(0L)
+
+    val gainedAvailableRamBytes: Long
+        get() = (afterAvailableRamBytes - beforeAvailableRamBytes).coerceAtLeast(0L)
+
+    val clearedSwapBytes: Long
+        get() = (beforeSwapUsedBytes - afterSwapUsedBytes).coerceAtLeast(0L)
+
+    val swapIsEmpty: Boolean
+        get() = afterSwapUsedBytes == 0L
+}
 
 class MemoryViewModel(application: Application) : AndroidViewModel(application) {
     private val rootAccess = RootAccess()
@@ -68,6 +97,12 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     var actionError by mutableStateOf<String?>(null)
+        private set
+
+    var aggressiveReclaimStage by mutableStateOf<String?>(null)
+        private set
+
+    var aggressiveReclaimReport by mutableStateOf<AggressiveReclaimReport?>(null)
         private set
 
     var zramClearSafety by mutableStateOf<ZramClearSafety?>(null)
@@ -210,6 +245,107 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun aggressiveBootLikeReclaim() {
+        if (actionInProgress || rootState != RootState.GRANTED) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            aggressiveReclaimReport = null
+            try {
+                aggressiveReclaimStage = "Capturing before-state memory readings…"
+                val before = withContext(Dispatchers.IO) { repository.readSnapshot() }
+
+                aggressiveReclaimStage = "Scanning current processes before closing user apps…"
+                val freshScan = withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
+                applyProcessScan(freshScan)
+
+                aggressiveReclaimStage = "Force-stopping current non-system user apps…"
+                val closeResult = withContext(Dispatchers.IO) {
+                    memoryActions.closeAllUserApps(freshScan.apps, ownPackageName)
+                }
+
+                delay(400)
+                aggressiveReclaimStage = "Killing remaining background processes, dropping clean caches and compacting memory…"
+                val kernelResult = withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
+
+                delay(800)
+                aggressiveReclaimStage = "Re-reading RAM and swap before the swapoff phase…"
+                var current = withContext(Dispatchers.IO) { repository.readSnapshot() }
+                var safety = memoryActions.getAllSwapClearSafety(current)
+                var swapPasses = 0
+                var allSwapWasDisabledAtOnce = false
+                var swappinessRestored = true
+                var swapMessage = when {
+                    current.swapDevices.isEmpty() -> "No active swap/ZRAM device was present after RAM reclaim."
+                    !safety.canClear -> "All-swap clear was blocked because ${safety.additionalNeededBytes} more bytes of MemAvailable headroom were required after aggressive RAM reclaim."
+                    else -> "All-swap clear had not started."
+                }
+
+                while (
+                    current.swapDevices.isNotEmpty() &&
+                    current.usedSwapBytes > 0L &&
+                    safety.canClear &&
+                    swapPasses < 2
+                ) {
+                    aggressiveReclaimStage = "Emptying all active swap/ZRAM together — pass ${swapPasses + 1}…"
+                    val clearResult = withContext(Dispatchers.IO) { memoryActions.clearAllSwap(current) }
+                    swapPasses += 1
+                    allSwapWasDisabledAtOnce = allSwapWasDisabledAtOnce || clearResult.allSwapDisabledAtOnce
+                    swappinessRestored = swappinessRestored && clearResult.swappinessRestored
+                    swapMessage = clearResult.message
+                    if (!clearResult.success) break
+
+                    delay(500)
+                    current = withContext(Dispatchers.IO) { repository.readSnapshot() }
+                    safety = memoryActions.getAllSwapClearSafety(current)
+                    if (current.usedSwapBytes == 0L) break
+                }
+
+                aggressiveReclaimStage = "Performing final background/cache reclaim after swap cycling…"
+                withContext(Dispatchers.IO) { memoryActions.aggressiveKernelReclaim() }
+                delay(700)
+
+                aggressiveReclaimStage = "Verifying final physical RAM and swap state…"
+                val after = withContext(Dispatchers.IO) { repository.readSnapshot() }
+                snapshot = after
+                zramClearSafety = memoryActions.getClearSafety(after)
+                errorMessage = null
+
+                val afterScan = runCatching {
+                    withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
+                }.getOrNull()
+                if (afterScan != null) applyProcessScan(afterScan)
+
+                aggressiveReclaimReport = AggressiveReclaimReport(
+                    beforeUsedRamBytes = before.usedRamBytes,
+                    afterUsedRamBytes = after.usedRamBytes,
+                    beforeAvailableRamBytes = before.availableRamBytes,
+                    afterAvailableRamBytes = after.availableRamBytes,
+                    beforeSwapUsedBytes = before.usedSwapBytes,
+                    afterSwapUsedBytes = after.usedSwapBytes,
+                    userAppCloseMessage = closeResult.message,
+                    kernelReclaimMessage = kernelResult.message,
+                    swapMessage = swapMessage,
+                    swapPasses = swapPasses,
+                    swapClearBlockedBytes = if (swapPasses == 0 && current.swapDevices.isNotEmpty() && !safety.canClear) safety.additionalNeededBytes else 0L,
+                    allSwapWasDisabledAtOnce = allSwapWasDisabledAtOnce,
+                    swappinessRestored = swappinessRestored
+                )
+                actionMessage = "Aggressive boot-like reclaim completed and final kernel readings were verified."
+            } catch (error: Throwable) {
+                actionError = error.message ?: "Aggressive reclaim failed before final verification."
+                runCatching { refreshMemory() }
+            } finally {
+                aggressiveReclaimStage = null
+                actionInProgress = false
+            }
+        }
+    }
+
+    fun clearAggressiveReclaimReport() {
+        aggressiveReclaimReport = null
+    }
+
     fun clearActionMessage() {
         actionMessage = null
         actionError = null
@@ -233,17 +369,22 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         appsScanError = null
         try {
             val scan = withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
-            runningApps = scan.apps
-            unmappedProcesses = scan.unmappedProcesses
-            appsInZram = scan.apps
-                .filter { it.attributedSwapBytes > 0L }
-                .map { it.toAppSwapUsage() }
-                .sortedByDescending { it.attributedSwapBytes }
+            applyProcessScan(scan)
         } catch (error: Throwable) {
             appsScanError = error.message ?: "Running-app memory information could not be read on this kernel."
         } finally {
             appsScanInProgress = false
         }
+    }
+
+    private fun applyProcessScan(scan: ProcessScanResult) {
+        runningApps = scan.apps
+        unmappedProcesses = scan.unmappedProcesses
+        appsInZram = scan.apps
+            .filter { it.attributedSwapBytes > 0L }
+            .map { it.toAppSwapUsage() }
+            .sortedByDescending { it.attributedSwapBytes }
+        appsScanError = null
     }
 
     private fun RunningAppUsage.toAppSwapUsage() = AppSwapUsage(
