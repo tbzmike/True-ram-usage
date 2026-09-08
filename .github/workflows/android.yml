@@ -68,6 +68,11 @@ jobs:
           cp app/build/outputs/apk/debug/app-debug.apk "$RELEASE_APK"
           APK_SHA256="$(sha256sum "$RELEASE_APK" | awk '{print $1}')"
           TAG="v${VERSION_NAME}-green-${GITHUB_RUN_NUMBER}"
+          RELEASE_HTML_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          APK_DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/true-ram-usage.apk"
+          LATEST_RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest"
+          LATEST_MANIFEST_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/update.json"
+          LATEST_APK_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/true-ram-usage.apk"
 
           cat > "$RUNNER_TEMP/update.json" <<EOF
           {
@@ -75,7 +80,13 @@ jobs:
             "versionName": "$VERSION_NAME",
             "runNumber": $GITHUB_RUN_NUMBER,
             "commitSha": "$GITHUB_SHA",
+            "releaseTag": "$TAG",
+            "releaseHtmlUrl": "$RELEASE_HTML_URL",
             "apkAssetName": "true-ram-usage.apk",
+            "apkDownloadUrl": "$APK_DOWNLOAD_URL",
+            "latestReleaseUrl": "$LATEST_RELEASE_URL",
+            "latestManifestUrl": "$LATEST_MANIFEST_URL",
+            "latestApkUrl": "$LATEST_APK_URL",
             "apkSha256": "$APK_SHA256",
             "certificateSha256": "${{ steps.signature.outputs.certificate_sha256 }}"
           }
@@ -116,7 +127,7 @@ jobs:
             --notes "Automatically published from passed Android Build #$GITHUB_RUN_NUMBER on main. Commit: $GITHUB_SHA. This APK passed assembly and fixed-signature verification before release publication." \
             --latest
 
-      - name: Verify latest green release endpoint
+      - name: Verify latest green release and updater URLs
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         env:
@@ -134,9 +145,40 @@ jobs:
           test "$APK_SIZE" -gt 0
           test -n "$MANIFEST_URL"
 
-          curl -fsSL -H 'User-Agent: True-RAM-Usage-CI' "$MANIFEST_URL" -o "$RUNNER_TEMP/published-update.json"
+          curl --fail --silent --show-error --location --retry 3 \
+            -H 'User-Agent: True-RAM-Usage-CI' \
+            "$MANIFEST_URL" \
+            -o "$RUNNER_TEMP/published-update.json"
           python -m json.tool "$RUNNER_TEMP/published-update.json" >/dev/null
           PUBLISHED_VERSION_CODE="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["versionCode"])' "$RUNNER_TEMP/published-update.json")"
           PUBLISHED_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["apkSha256"])' "$RUNNER_TEMP/published-update.json")"
+          PUBLISHED_TAG="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["releaseTag"])' "$RUNNER_TEMP/published-update.json")"
           test "$PUBLISHED_VERSION_CODE" = "$EXPECTED_VERSION_CODE"
           test "$PUBLISHED_SHA256" = "$EXPECTED_SHA256"
+          test "$PUBLISHED_TAG" = "$EXPECTED_TAG"
+
+          LATEST_PAGE_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest"
+          STABLE_MANIFEST_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.json"
+          STABLE_APK_URL="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/true-ram-usage.apk"
+
+          FINAL_RELEASE_PAGE="$(curl --fail --silent --show-error --location --retry 3 \
+            -H 'User-Agent: True-RAM-Usage-CI' \
+            -o /dev/null -w '%{url_effective}' "$LATEST_PAGE_URL")"
+          test "$FINAL_RELEASE_PAGE" = "https://github.com/$GITHUB_REPOSITORY/releases/tag/$EXPECTED_TAG"
+
+          curl --fail --silent --show-error --location --retry 3 \
+            -H 'User-Agent: True-RAM-Usage-CI' \
+            "$STABLE_MANIFEST_URL" \
+            -o "$RUNNER_TEMP/stable-update.json"
+          python -m json.tool "$RUNNER_TEMP/stable-update.json" >/dev/null
+          STABLE_VERSION_CODE="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["versionCode"])' "$RUNNER_TEMP/stable-update.json")"
+          STABLE_TAG="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["releaseTag"])' "$RUNNER_TEMP/stable-update.json")"
+          test "$STABLE_VERSION_CODE" = "$EXPECTED_VERSION_CODE"
+          test "$STABLE_TAG" = "$EXPECTED_TAG"
+
+          curl --fail --silent --show-error --location --retry 3 \
+            -H 'User-Agent: True-RAM-Usage-CI' \
+            "$STABLE_APK_URL" \
+            -o "$RUNNER_TEMP/stable-latest.apk"
+          STABLE_APK_SHA256="$(sha256sum "$RUNNER_TEMP/stable-latest.apk" | awk '{print $1}')"
+          test "$STABLE_APK_SHA256" = "$EXPECTED_SHA256"
