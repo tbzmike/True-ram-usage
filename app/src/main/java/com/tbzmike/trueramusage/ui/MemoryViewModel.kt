@@ -17,6 +17,7 @@ import com.tbzmike.trueramusage.data.RootAccess
 import com.tbzmike.trueramusage.data.RootState
 import com.tbzmike.trueramusage.data.RunningAppUsage
 import com.tbzmike.trueramusage.data.ThemeMode
+import com.tbzmike.trueramusage.data.UnmappedProcessUsage
 import com.tbzmike.trueramusage.data.ZramClearSafety
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -39,6 +40,9 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     var runningApps by mutableStateOf<List<RunningAppUsage>>(emptyList())
+        private set
+
+    var unmappedProcesses by mutableStateOf<List<UnmappedProcessUsage>>(emptyList())
         private set
 
     var appsScanError by mutableStateOf<String?>(null)
@@ -121,7 +125,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
             actionInProgress = true
             clearActionMessage()
             val result = withContext(Dispatchers.IO) {
-                memoryActions.closeApp(app.packageName, app.isSystemApp)
+                memoryActions.closeApp(app.packageName, app.isSystemApp, ownPackageName)
             }
             if (result.success) actionMessage = result.message else actionError = result.message
             delay(700)
@@ -143,6 +147,37 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
             delay(900)
             refreshMemory()
             refreshApps()
+            actionInProgress = false
+        }
+    }
+
+    fun closeAllUserApps() {
+        if (actionInProgress || runningApps.isEmpty()) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            val result = withContext(Dispatchers.IO) {
+                memoryActions.closeAllUserApps(runningApps, ownPackageName)
+            }
+            if (result.success) actionMessage = result.message else actionError = result.message
+            delay(900)
+            refreshMemory()
+            refreshApps()
+            actionInProgress = false
+        }
+    }
+
+    fun reclaimFileCaches() {
+        if (actionInProgress) return
+        viewModelScope.launch {
+            actionInProgress = true
+            clearActionMessage()
+            val result = withContext(Dispatchers.IO) {
+                memoryActions.reclaimFileCaches()
+            }
+            if (result.success) actionMessage = result.message else actionError = result.message
+            delay(500)
+            refreshMemory()
             actionInProgress = false
         }
     }
@@ -186,10 +221,11 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         appsScanInProgress = true
         appsScanError = null
         try {
-            val running = withContext(Dispatchers.IO) { appSwapRepository.readRunningApps() }
-            runningApps = running
-            appsInZram = running
-                .filter { it.swapBytes > 0L }
+            val scan = withContext(Dispatchers.IO) { appSwapRepository.readUsage() }
+            runningApps = scan.apps
+            unmappedProcesses = scan.unmappedProcesses
+            appsInZram = scan.apps
+                .filter { it.attributedSwapBytes > 0L }
                 .map { it.toAppSwapUsage() }
                 .sortedByDescending { it.attributedSwapBytes }
         } catch (error: Throwable) {
@@ -203,14 +239,16 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
         packageName = packageName,
         label = label,
         uid = uid,
-        attributedSwapBytes = swapBytes,
+        attributedSwapBytes = attributedSwapBytes,
         rawSwapBytes = swapBytes,
         residentBytes = residentBytes,
-        pssBytes = 0L,
+        pssBytes = pssBytes,
         processCount = processCount,
         isSystemApp = isSystemApp,
         processes = processes,
         runningSeconds = runningSeconds,
-        cpuTimeSeconds = cpuTimeSeconds
+        cpuTimeSeconds = cpuTimeSeconds,
+        proportionalMetricsAvailable = proportionalMetricsAvailable,
+        isolatedProcessCount = isolatedProcessCount
     )
 }
