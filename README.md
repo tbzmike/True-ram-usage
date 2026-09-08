@@ -11,7 +11,9 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 - Fall back per process to RSS and `VmSwap` without pretending the fallback is proportional attribution.
 - Show native or unmapped processes that cannot safely be assigned to an installed Android package.
 - Expose memory categories such as anonymous pages, cache, shmem, slab, kernel stacks, page tables and unevictable memory so abnormal kernel/system RAM use can be diagnosed.
+- Compare total attributed process RAM with system used RAM to expose the diagnostic gap that may be explained by kernel memory, caches, shmem or other non-process categories.
 - Provide guarded recovery actions: force-stop non-system user apps, reclaim clean file/kernel caches, and cycle ZRAM only when a safety estimate shows enough physical RAM for `swapoff`.
+- Minimize the monitor's own observer effect by stopping periodic kernel polling while the Activity is backgrounded and lazily composing long process lists.
 - Never claim that physical RAM can be made literally empty; Android and the Linux kernel will immediately retain or reuse memory required for services, kernel structures and caches.
 - Never claim a capability that the current device/kernel does not expose.
 
@@ -19,13 +21,15 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 
 - Name: True RAM Usage
 - Package: `com.tbzmike.trueramusage`
-- Current development version: `0.5.0`
+- Current development version: `0.5.1`
 
 ## Physical RAM accounting
 
 The system overview uses `MemTotal - MemAvailable` from `/proc/meminfo` for effective used physical RAM. Detailed mode also exposes direct kernel counters including `AnonPages`, `Cached`, `Buffers`, `Shmem`, `Slab`, `SReclaimable`, `SUnreclaim`, `KernelStack`, `PageTables`, `Unevictable`, `Mlocked`, `Dirty` and `Writeback`.
 
 These counters are diagnostic categories and some overlap; they are not added together as a second RAM total.
+
+A low-available-RAM warning is shown when available physical RAM falls below the larger of 512 MiB or 10% of total RAM, matching the same reserve scale used by the guarded ZRAM-clear safety check.
 
 ## Per-app RAM and swap attribution
 
@@ -37,6 +41,19 @@ The process scanner first reads the fast `/proc/<pid>/status` counters for UID, 
 If proportional counters are unavailable for a process, that process falls back to RSS and `VmSwap`, and the UI labels the fallback rather than presenting it as equivalent to PSS.
 
 Processes using isolated or otherwise non-package UIDs are also checked by process name where a safe installed-package match exists. Remaining native/unmapped processes are shown separately in detailed mode instead of being silently discarded.
+
+Long running-app, swap-app and native-process lists use bounded lazy Compose lists so the memory monitor does not eagerly compose every row at once.
+
+## Process accounting coverage
+
+After a root process scan, the app compares:
+
+- mapped app attributed physical RAM,
+- native/unmapped attributed physical RAM,
+- their combined process total,
+- system used physical RAM.
+
+A positive gap is not automatically a leak; it can include kernel memory, caches, shmem and other non-process categories. A negative gap can occur when some processes fall back to RSS because RSS can double-count shared pages. The comparison is therefore a diagnostic clue, not a replacement for `/proc/meminfo`.
 
 ## ZRAM accounting
 
@@ -55,12 +72,17 @@ ZRAM's own physical-memory cost is already included in system used RAM; the app 
 When RAM is unusually full, the recommended sequence is:
 
 1. Refresh the process scan and inspect mapped apps plus native/unmapped processes.
-2. Force-stop running non-system user apps when an aggressive diagnostic reclaim is intentionally desired.
-3. Reclaim clean page cache and reclaimable filesystem metadata with `sync` and `/proc/sys/vm/drop_caches` when the kernel/SELinux policy permits it.
-4. Refresh the physical-RAM breakdown to see what remains.
-5. Cycle ZRAM only when the app's guarded safety estimate shows enough available physical RAM to bring swapped pages back during `swapoff`.
+2. Compare the process-accounting coverage gap with the detailed kernel/cache breakdown.
+3. Force-stop running non-system user apps when an aggressive diagnostic reclaim is intentionally desired.
+4. Reclaim clean page cache and reclaimable filesystem metadata with `sync` and `/proc/sys/vm/drop_caches` when the kernel/SELinux policy permits it.
+5. Refresh the physical-RAM breakdown to see what remains.
+6. Cycle ZRAM only when the app's guarded safety estimate shows enough available physical RAM to bring swapped pages back during `swapoff`.
 
-If physical RAM remains abnormally high after user apps and reclaimable caches have been removed, the remaining `/proc/meminfo` categories and native/unmapped process list are intended to help distinguish kernel/slab/shmem/unevictable/system-process pressure from ordinary application use.
+If physical RAM remains abnormally high after user apps and reclaimable caches have been removed, the remaining `/proc/meminfo` categories, process-coverage gap and native/unmapped process list are intended to help distinguish kernel/slab/shmem/unevictable/system-process pressure from ordinary application use.
+
+## Monitoring overhead
+
+The 2-second system memory poll runs only while the Activity is started. It is cancelled in the background and restarted when the app returns to the foreground. Expensive PSS/SwapPss process scans remain explicit rather than running continuously.
 
 ## Capability levels
 
