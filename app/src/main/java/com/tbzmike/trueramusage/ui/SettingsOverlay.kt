@@ -218,10 +218,8 @@ fun SettingsOverlay(
                             }
                         }
 
-                        if (updateVm.latestRelease != null || updateVm.stagedUpdate?.releaseHtmlUrl?.isNotBlank() == true) {
-                            TextButton(onClick = updateVm::openLatestRelease, modifier = Modifier.fillMaxWidth()) {
-                                Text("Open latest GitHub release")
-                            }
+                        TextButton(onClick = updateVm::openLatestRelease, modifier = Modifier.fillMaxWidth()) {
+                            Text("Open latest GitHub release")
                         }
 
                         HorizontalDivider()
