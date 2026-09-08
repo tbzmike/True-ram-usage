@@ -14,6 +14,7 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 - Compare total attributed process RAM with system used RAM to expose the diagnostic gap that may be explained by kernel memory, caches, shmem or other non-process categories.
 - Provide guarded recovery actions: force-stop non-system user apps, reclaim clean file/kernel caches, and cycle ZRAM only when a safety estimate shows enough physical RAM for `swapoff`.
 - Minimize the monitor's own observer effect by stopping periodic kernel polling while the Activity is backgrounded and lazily composing long process lists.
+- Publish every passed `main` build as the latest green GitHub Release and let the app retrieve verified updates directly from that release feed.
 - Never claim that physical RAM can be made literally empty; Android and the Linux kernel will immediately retain or reuse memory required for services, kernel structures and caches.
 - Never claim a capability that the current device/kernel does not expose.
 
@@ -21,7 +22,33 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 
 - Name: True RAM Usage
 - Package: `com.tbzmike.trueramusage`
-- Current development version: `0.5.1`
+- Current development version: `0.6.0`
+
+## Latest green build baseline
+
+The Android Build workflow remains the release gate. Pull requests compile and verify the fixed development signature but do not publish releases. A successful push build on `main` performs these extra steps only after APK assembly and signature verification have passed:
+
+1. Copy the exact passed debug APK to the stable release asset name `true-ram-usage.apk`.
+2. Generate `update.json` containing versionCode, versionName, CI run number, commit SHA, APK SHA-256 and signing-certificate SHA-256.
+3. Force-move the repository tag `latest-green` to that exact passed commit.
+4. Create a versioned GitHub Release, mark it as GitHub's latest release and upload both `true-ram-usage.apk` and `update.json`.
+5. Query GitHub's `/releases/latest` endpoint and verify that the published manifest and APK asset are present and that the manifest matches the build that just passed.
+
+Older green releases remain available for rollback while `latest-green` always identifies the newest passed `main` commit.
+
+## App updates
+
+True RAM Usage reads the public GitHub Releases API for `tbzmike/True-ram-usage` and treats GitHub's latest release as the update source. The app does not install a downloaded file merely because it came from GitHub. Before installation it verifies:
+
+- the APK SHA-256 against `update.json`,
+- the APK package name against `com.tbzmike.trueramusage`,
+- the APK versionCode against the release manifest,
+- the release signing-certificate SHA-256 against the currently installed app,
+- the downloaded APK signing certificate against the currently installed app.
+
+Manual updates are available from the floating **Updates** control. **Check for updates** queries the latest green release. A newer verified build can be downloaded and installed immediately. Root installation is attempted first; if root is unavailable, Android's normal package installer is opened. Android 8 and later may require the user to allow True RAM Usage as an install source before the normal installer can proceed.
+
+Automatic updates are enabled by default. WorkManager checks for a newer green release every six hours when network connectivity is available. A newer APK is downloaded and verified in the app's private storage. If root has previously been granted to True RAM Usage, unattended root installation is attempted. If unattended installation is unavailable, the verified APK remains staged and the Updates control offers manual installation the next time the app is opened.
 
 ## Physical RAM accounting
 
@@ -86,11 +113,11 @@ The 2-second system memory poll runs only while the Activity is started. It is c
 
 ## Capability levels
 
-The current implementation supports normal read-only kernel counters where Android permissions allow them and root-assisted process/ZRAM diagnostics and recovery actions. Shizuku-assisted access remains a planned capability and is not currently implemented.
+The current implementation supports normal read-only kernel counters where Android permissions allow them and root-assisted process/ZRAM diagnostics, recovery actions and unattended self-updates. Shizuku-assisted access remains a planned capability and is not currently implemented.
 
 ## Development signing
 
-Debug APKs are signed with the repository's fixed **development/test key** so every future debug build has the same Android signing identity.
+Debug APKs are signed with the repository's fixed **development/test key** so every future debug build has the same Android signing identity and can update an earlier debug build.
 
 Development certificate SHA-256:
 
@@ -100,4 +127,4 @@ The development key is intentionally public and must never be used as a producti
 
 ## Safety
 
-Process-closing and memory-tuning actions are separated from read-only monitoring. True RAM Usage protects itself and system apps from the bulk close actions. Cache reclaim does not change VM tuning values. ZRAM cycling validates the device path and refuses to start when the available-RAM safety estimate is insufficient.
+Process-closing and memory-tuning actions are separated from read-only monitoring. True RAM Usage protects itself and system apps from the bulk close actions. Cache reclaim does not change VM tuning values. ZRAM cycling validates the device path and refuses to start when the available-RAM safety estimate is insufficient. Update installation only proceeds after the downloaded APK passes hash, package-name, version and signing-certificate verification.
