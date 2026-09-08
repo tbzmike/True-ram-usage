@@ -23,7 +23,7 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 
 - Name: True RAM Usage
 - Package: `com.tbzmike.trueramusage`
-- Current development version: `0.8.0`
+- Current development version: `0.8.1`
 
 ## Settings
 
@@ -58,7 +58,11 @@ Older green releases remain available for rollback while `latest-green` always i
 
 ## App updates
 
-True RAM Usage reads the public GitHub Releases API for `tbzmike/True-ram-usage` and treats GitHub's latest release as the update source. The app does not install a downloaded file merely because it came from GitHub. Before installation it verifies:
+True RAM Usage now treats the normal GitHub Releases site as its primary update-discovery source instead of depending only on `api.github.com`. It first opens `https://github.com/tbzmike/True-ram-usage/releases/latest`, follows GitHub's redirect to the current versioned release tag, then retrieves that release's `update.json` and `true-ram-usage.apk` directly from the normal `github.com` release-download host. The public GitHub Releases API remains a fallback if the normal release-page path fails.
+
+This dual-source discovery prevents `api.github.com` DNS or filtering failures from being the only path to updates. Settings also keeps **Open latest GitHub release** available even when automatic discovery fails, giving the user a manual fallback to the stable `github.com/.../releases/latest` page.
+
+The app does not install a downloaded file merely because it came from GitHub. Before installation it verifies:
 
 - the APK SHA-256 against `update.json`,
 - the APK package name against `com.tbzmike.trueramusage`,
@@ -66,7 +70,7 @@ True RAM Usage reads the public GitHub Releases API for `tbzmike/True-ram-usage`
 - the release signing-certificate SHA-256 against the currently installed app,
 - the downloaded APK signing certificate against the currently installed app.
 
-Manual updates live in **Settings → App updates**. **Check for updates now** queries the latest green release. A newer verified build can be downloaded and installed immediately. Root installation is attempted first; if root is unavailable, Android's normal package installer is opened. Android 8 and later may require the user to allow True RAM Usage as an install source before the normal installer can proceed.
+Manual updates live in **Settings → App updates**. **Check for updates now** resolves the latest green release. A newer verified build can be downloaded and installed immediately. Root installation is attempted first; if root is unavailable, Android's normal package installer is opened. Android 8 and later may require the user to allow True RAM Usage as an install source before the normal installer can proceed.
 
 Automatic green-build checks are enabled by default. WorkManager checks for a newer green release every six hours when network connectivity is available. A newer APK is downloaded and verified in the app's private storage. Automatic installation is a separate persisted setting and is also enabled by default to preserve the existing updater behavior. When automatic installation is enabled and root has previously been granted, unattended root installation is attempted. When it is disabled or root is unavailable, the verified APK remains staged and Settings offers manual installation.
 
