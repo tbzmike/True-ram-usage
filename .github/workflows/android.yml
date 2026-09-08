@@ -6,12 +6,17 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -28,17 +33,19 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Verify fixed development signature
+        id: signature
         shell: bash
         run: |
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
           test -n "$APKSIGNER"
           CERT_OUTPUT="$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk)"
           echo "$CERT_OUTPUT"
-          CERT_SHA256="$(printf '%s\n' "$CERT_OUTPUT" | awk -F': ' 'tolower($0) ~ /certificate sha-256 digest/ {print tolower($NF); exit}')"
+          CERT_SHA256="$(printf '%s\n' "$CERT_OUTPUT" | awk -F': ' 'tolower($0) ~ /certificate sha-256 digest/ {print tolower($NF); exit}' | tr -d ':')"
           EXPECTED_SHA256="1a3d8693351e6536fba6c900526850a878a0827bc1aa806ced994ec4b9da36ec"
           echo "APK signing SHA-256: $CERT_SHA256"
           test -n "$CERT_SHA256"
           test "$CERT_SHA256" = "$EXPECTED_SHA256"
+          echo "certificate_sha256=$CERT_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Upload debug APK
         if: success()
@@ -46,3 +53,90 @@ jobs:
         with:
           name: true-ram-usage-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Prepare latest green release metadata
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: release_meta
+        shell: bash
+        run: |
+          VERSION_CODE="$(grep -E '^[[:space:]]*versionCode[[:space:]]*=' app/build.gradle.kts | head -n 1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/')"
+          VERSION_NAME="$(grep -E '^[[:space:]]*versionName[[:space:]]*=' app/build.gradle.kts | head -n 1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          test -n "$VERSION_CODE"
+          test -n "$VERSION_NAME"
+
+          RELEASE_APK="$RUNNER_TEMP/true-ram-usage.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$RELEASE_APK"
+          APK_SHA256="$(sha256sum "$RELEASE_APK" | awk '{print $1}')"
+          TAG="v${VERSION_NAME}-green-${GITHUB_RUN_NUMBER}"
+
+          cat > "$RUNNER_TEMP/update.json" <<EOF
+          {
+            "versionCode": $VERSION_CODE,
+            "versionName": "$VERSION_NAME",
+            "runNumber": $GITHUB_RUN_NUMBER,
+            "commitSha": "$GITHUB_SHA",
+            "apkAssetName": "true-ram-usage.apk",
+            "apkSha256": "$APK_SHA256",
+            "certificateSha256": "${{ steps.signature.outputs.certificate_sha256 }}"
+          }
+          EOF
+
+          python -m json.tool "$RUNNER_TEMP/update.json" >/dev/null
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Move latest-green baseline tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest-green "$GITHUB_SHA"
+          git push --force origin refs/tags/latest-green
+
+      - name: Publish latest green GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_meta.outputs.tag }}
+          VERSION_NAME: ${{ steps.release_meta.outputs.version_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            "$RUNNER_TEMP/true-ram-usage.apk#True RAM Usage APK" \
+            "$RUNNER_TEMP/update.json#Updater manifest" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "True RAM Usage $VERSION_NAME — Green build #$GITHUB_RUN_NUMBER" \
+            --notes "Automatically published from passed Android Build #$GITHUB_RUN_NUMBER on main. Commit: $GITHUB_SHA. This APK passed assembly and fixed-signature verification before release publication." \
+            --latest
+
+      - name: Verify latest green release endpoint
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG: ${{ steps.release_meta.outputs.tag }}
+          EXPECTED_VERSION_CODE: ${{ steps.release_meta.outputs.version_code }}
+          EXPECTED_SHA256: ${{ steps.release_meta.outputs.apk_sha256 }}
+        run: |
+          LATEST_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')"
+          test "$LATEST_TAG" = "$EXPECTED_TAG"
+
+          APK_SIZE="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.assets[] | select(.name == "true-ram-usage.apk") | .size')"
+          MANIFEST_URL="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.assets[] | select(.name == "update.json") | .browser_download_url')"
+          test -n "$APK_SIZE"
+          test "$APK_SIZE" -gt 0
+          test -n "$MANIFEST_URL"
+
+          curl -fsSL -H 'User-Agent: True-RAM-Usage-CI' "$MANIFEST_URL" -o "$RUNNER_TEMP/published-update.json"
+          python -m json.tool "$RUNNER_TEMP/published-update.json" >/dev/null
+          PUBLISHED_VERSION_CODE="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["versionCode"])' "$RUNNER_TEMP/published-update.json")"
+          PUBLISHED_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["apkSha256"])' "$RUNNER_TEMP/published-update.json")"
+          test "$PUBLISHED_VERSION_CODE" = "$EXPECTED_VERSION_CODE"
+          test "$PUBLISHED_SHA256" = "$EXPECTED_SHA256"
