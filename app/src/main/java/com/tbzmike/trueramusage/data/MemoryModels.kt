@@ -132,7 +132,7 @@ data class AppSwapUsage(
     val isolatedProcessCount: Int = 0
 ) {
     val attributedRamBytes: Long
-        get() = if (proportionalMetricsAvailable) pssBytes else residentBytes
+        get() = processes.sumOf { it.attributedRamBytes }
 }
 
 data class RunningAppUsage(
@@ -152,10 +152,10 @@ data class RunningAppUsage(
     val processes: List<ProcessSwapUsage>
 ) {
     val attributedRamBytes: Long
-        get() = if (proportionalMetricsAvailable) pssBytes else residentBytes
+        get() = processes.sumOf { it.attributedRamBytes }
 
     val attributedSwapBytes: Long
-        get() = if (proportionalMetricsAvailable) swapPssBytes else swapBytes
+        get() = processes.sumOf { it.attributedSwapBytes }
 }
 
 data class UnmappedProcessUsage(
