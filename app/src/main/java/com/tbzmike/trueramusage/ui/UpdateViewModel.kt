@@ -131,7 +131,16 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
 
     fun openLatestRelease() {
         val url = latestRelease?.releaseHtmlUrl ?: stagedUpdate?.releaseHtmlUrl.orEmpty()
-        if (!repository.openReleasePage(url)) message = "No GitHub release page is available yet."
+        if (!repository.openReleasePage(url)) {
+            message = "Android could not open the latest GitHub release page."
+        }
+    }
+
+    fun openLatestApkDownload() {
+        val url = latestRelease?.apkDownloadUrl.orEmpty()
+        if (!repository.openLatestApkDownload(url)) {
+            message = "Android could not open the latest green APK download link."
+        }
     }
 
     fun clearMessage() {
