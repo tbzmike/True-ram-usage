@@ -12,17 +12,17 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 - Show native or unmapped processes that cannot safely be assigned to an installed Android package.
 - Expose memory categories such as anonymous pages, cache, shmem, slab, kernel stacks, page tables and unevictable memory so abnormal kernel/system RAM use can be diagnosed.
 - Compare total attributed process RAM with system used RAM to expose the diagnostic gap that may be explained by kernel memory, caches, shmem or other non-process categories.
-- Provide guarded recovery actions: force-stop non-system user apps, reclaim clean file/kernel caches, and cycle ZRAM only when a safety estimate shows enough physical RAM for `swapoff`.
+- Provide guarded recovery actions: force-stop non-system user apps, reclaim clean file/kernel caches, cycle ZRAM, and run an explicitly aggressive boot-like reclaim that also attempts to empty every active swap device.
 - Minimize the monitor's own observer effect by stopping periodic kernel polling while the Activity is backgrounded and lazily composing long process lists.
 - Publish every passed `main` build as the latest green GitHub Release and let the app retrieve verified updates directly from that release feed.
-- Never claim that physical RAM can be made literally empty; Android and the Linux kernel will immediately retain or reuse memory required for services, kernel structures and caches.
+- Never claim that physical RAM can be made literally empty or guaranteed to match a reboot; Android and the Linux kernel retain required services, kernel structures and caches and may immediately reuse freed memory.
 - Never claim a capability that the current device/kernel does not expose.
 
 ## App identity
 
 - Name: True RAM Usage
 - Package: `com.tbzmike.trueramusage`
-- Current development version: `0.6.0`
+- Current development version: `0.7.0`
 
 ## Latest green build baseline
 
@@ -56,7 +56,7 @@ The system overview uses `MemTotal - MemAvailable` from `/proc/meminfo` for effe
 
 These counters are diagnostic categories and some overlap; they are not added together as a second RAM total.
 
-A low-available-RAM warning is shown when available physical RAM falls below the larger of 512 MiB or 10% of total RAM, matching the same reserve scale used by the guarded ZRAM-clear safety check.
+A low-available-RAM warning is shown when available physical RAM falls below the larger of 512 MiB or 10% of total RAM, matching the reserve scale used by guarded swapoff operations.
 
 ## Per-app RAM and swap attribution
 
@@ -94,9 +94,32 @@ Detailed ZRAM information is read from `/sys/block/zram*/mm_stat`, `disksize`, `
 
 ZRAM's own physical-memory cost is already included in system used RAM; the app displays it separately only to explain where that portion of physical RAM went.
 
+## Aggressive boot-like reclaim
+
+The floating **Aggressive reclaim** control is intended for the specific case where RAM has become abnormally full and a reboot would otherwise be used simply to reclaim memory. The operation deliberately does more than the normal recovery controls but still verifies dangerous steps before running them.
+
+The sequence is:
+
+1. Capture a fresh before-state `/proc/meminfo` and `/proc/swaps` snapshot.
+2. Run a fresh rooted process scan instead of trusting an earlier app list.
+3. Force-stop current mapped non-system user apps while protecting True RAM Usage itself and mapped system apps.
+4. Run Android's `am kill-all` to kill remaining background processes that Android considers background-killable.
+5. Run `sync`, then request `drop_caches=3` so clean page cache plus reclaimable dentries/inodes can be released when the kernel/SELinux policy permits it.
+6. Request `compact_memory=1` when the kernel exposes that interface. This compacts memory zones but does not create more total RAM by itself.
+7. Re-read `MemAvailable`, active swap devices and current swap usage after the earlier reclaim steps.
+8. Calculate whether all currently swapped pages can fit back in physical RAM while retaining a reserve equal to the larger of 512 MiB or 10% of total RAM.
+9. Only when that fresh safety check passes, temporarily lower swappiness to 0 where permitted, disable every active swap/ZRAM device, verify that all swap was off together at one point, re-enable every device with its recorded priority, and restore the original swappiness value.
+10. If Android immediately repopulates swap and a second fresh safety check still passes, one additional all-swap pass is allowed. The operation never loops indefinitely.
+11. Run one final background/cache reclaim and capture a final kernel snapshot plus process scan.
+12. Show the measured before/after RAM and swap values, whether swap was actually verified empty, whether all swap devices were disabled together, whether swappiness was restored, and any reason a swap phase was blocked or failed.
+
+This is intentionally described as **boot-like**, not identical to a reboot. A real reboot reconstructs kernel state and restarts framework/services from scratch. True RAM Usage cannot safely discard required kernel memory or stop essential Android services just to make a number smaller. The aggressive action instead removes current user/background processes and reclaimable caches, compacts memory, and empties swap when the kernel reports enough physical headroom to do so without knowingly driving the device into OOM pressure.
+
+If all active swap cannot be safely emptied after the first reclaim stages, the app reports the exact additional `MemAvailable` headroom required and does not run `swapoff`.
+
 ## Recovery and diagnosis
 
-When RAM is unusually full, the recommended sequence is:
+When RAM is unusually full, the normal diagnostic sequence is:
 
 1. Refresh the process scan and inspect mapped apps plus native/unmapped processes.
 2. Compare the process-accounting coverage gap with the detailed kernel/cache breakdown.
@@ -105,7 +128,7 @@ When RAM is unusually full, the recommended sequence is:
 5. Refresh the physical-RAM breakdown to see what remains.
 6. Cycle ZRAM only when the app's guarded safety estimate shows enough available physical RAM to bring swapped pages back during `swapoff`.
 
-If physical RAM remains abnormally high after user apps and reclaimable caches have been removed, the remaining `/proc/meminfo` categories, process-coverage gap and native/unmapped process list are intended to help distinguish kernel/slab/shmem/unevictable/system-process pressure from ordinary application use.
+The **Aggressive reclaim** control combines and extends these steps when the goal is to avoid a reboot used only for memory reclamation. If physical RAM remains abnormally high even after the aggressive action, the final `/proc/meminfo` categories, process-coverage gap and native/unmapped process list are intended to help distinguish kernel/slab/shmem/unevictable/system-process pressure from ordinary application use.
 
 ## Monitoring overhead
 
@@ -127,4 +150,4 @@ The development key is intentionally public and must never be used as a producti
 
 ## Safety
 
-Process-closing and memory-tuning actions are separated from read-only monitoring. True RAM Usage protects itself and system apps from the bulk close actions. Cache reclaim does not change VM tuning values. ZRAM cycling validates the device path and refuses to start when the available-RAM safety estimate is insufficient. Update installation only proceeds after the downloaded APK passes hash, package-name, version and signing-certificate verification.
+Process-closing and memory-tuning actions are separated from read-only monitoring. True RAM Usage protects itself and mapped system apps from bulk force-stop actions. Cache reclaim does not permanently change VM tuning values. The aggressive all-swap path validates every active swap path, uses a fresh `MemAvailable` headroom check, attempts rollback if swapoff fails partway through, re-enables all previously active swap devices with their recorded priorities, and restores the original swappiness value when it was temporarily changed. Update installation only proceeds after the downloaded APK passes hash, package-name, version and signing-certificate verification.
