@@ -221,11 +221,14 @@ fun SettingsOverlay(
                         TextButton(onClick = updateVm::openLatestRelease, modifier = Modifier.fillMaxWidth()) {
                             Text("Open latest GitHub release")
                         }
+                        TextButton(onClick = updateVm::openLatestApkDownload, modifier = Modifier.fillMaxWidth()) {
+                            Text("Download latest APK in browser")
+                        }
 
                         HorizontalDivider()
                         SettingsSectionTitle("About update safety")
                         Text(
-                            "Only GitHub's latest passed main release is used. Before installation, True RAM Usage verifies the manifest SHA-256, package name, versionCode, and signing certificate against the currently installed app.",
+                            "The updater reads GitHub's stable latest-release manifest and APK links first, with the GitHub Releases API only as a fallback. Before installation, True RAM Usage verifies the manifest SHA-256, package name, versionCode, and signing certificate against the currently installed app.",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
