@@ -43,12 +43,11 @@ fun UpdateOverlay(vm: UpdateViewModel, modifier: Modifier = Modifier) {
     MaterialTheme(colorScheme = colors) {
         ExtendedFloatingActionButton(
             onClick = { open = true },
-            modifier = modifier,
-            text = {
-                val staged = vm.stagedUpdate
-                Text(if (staged != null) "Install ${staged.versionName}" else if (vm.updateAvailable) "Update available" else "Updates")
-            }
-        )
+            modifier = modifier
+        ) {
+            val staged = vm.stagedUpdate
+            Text(if (staged != null) "Install ${staged.versionName}" else if (vm.updateAvailable) "Update available" else "Updates")
+        }
 
         if (open) {
             AlertDialog(
