@@ -13,6 +13,7 @@ import com.tbzmike.trueramusage.data.RootState
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.security.MessageDigest
 
@@ -24,56 +25,66 @@ class UpdateRepository(private val context: Context) {
     fun currentVersionName(): String = installedPackageInfo().versionName.orEmpty()
 
     fun fetchLatestGreenRelease(): GreenRelease {
-        val webAttempt = runCatching { fetchLatestGreenReleaseFromGithubWeb() }
-        webAttempt.getOrNull()?.let { return it }
+        val stableAssetAttempt = runCatching { fetchLatestGreenReleaseFromStableAssets() }
+        stableAssetAttempt.getOrNull()?.let { return it }
 
         val apiAttempt = runCatching { fetchLatestGreenReleaseFromApi() }
         apiAttempt.getOrNull()?.let { return it }
 
-        val webError = webAttempt.exceptionOrNull()?.message.orEmpty().ifBlank { "unknown error" }
+        val stableError = stableAssetAttempt.exceptionOrNull()?.message.orEmpty().ifBlank { "unknown error" }
         val apiError = apiAttempt.exceptionOrNull()?.message.orEmpty().ifBlank { "unknown error" }
         error(
-            "GitHub update check failed on both github.com and api.github.com. " +
-                "github.com: $webError; api.github.com: $apiError"
+            "GitHub update check failed. Stable latest-release asset: $stableError; " +
+                "API fallback: $apiError"
         )
     }
 
-    private fun fetchLatestGreenReleaseFromGithubWeb(): GreenRelease {
-        val tagName = resolveLatestReleaseTagFromGithubWeb()
-        val manifestUrl = releaseAssetUrl(tagName, UPDATE_MANIFEST_ASSET)
-        val manifest = JSONObject(readText(manifestUrl, githubApi = false, accept = JSON_ACCEPT))
+    private fun fetchLatestGreenReleaseFromStableAssets(): GreenRelease {
+        val manifest = JSONObject(
+            readText(
+                LATEST_MANIFEST_URL,
+                githubApi = false,
+                accept = JSON_ACCEPT
+            )
+        )
+        return releaseFromManifest(manifest)
+    }
+
+    private fun releaseFromManifest(manifest: JSONObject): GreenRelease {
         val apkAssetName = manifest.getString("apkAssetName")
         checkSafeReleasePart(apkAssetName, "APK asset name")
 
+        val releaseTag = manifest.optString("releaseTag")
+            .takeIf { it.isNotBlank() }
+            ?.also { checkSafeReleasePart(it, "release tag") }
+
+        val releaseHtmlUrl = manifest.optString("releaseHtmlUrl")
+            .takeIf { it.isNotBlank() && isTrustedReleasePageUrl(it) }
+            ?: releaseTag?.let { "$RELEASE_TAG_BASE/$it" }
+            ?: LATEST_RELEASE_WEB
+
+        val manifestApkUrl = manifest.optString("apkDownloadUrl")
+            .takeIf { it.isNotBlank() && isTrustedReleaseAssetUrl(it, apkAssetName) }
+
+        val apkDownloadUrl = manifestApkUrl
+            ?: releaseTag?.let { releaseAssetUrl(it, apkAssetName) }
+            ?: latestAssetUrl(apkAssetName)
+
         return validateRelease(
             GreenRelease(
-                tagName = tagName,
+                tagName = releaseTag ?: "latest",
                 releaseName = "True RAM Usage ${manifest.getString("versionName")} — Green build #${manifest.getLong("runNumber")}",
-                releaseHtmlUrl = "$RELEASE_TAG_BASE/$tagName",
+                releaseHtmlUrl = releaseHtmlUrl,
                 versionCode = manifest.getLong("versionCode"),
                 versionName = manifest.getString("versionName"),
                 runNumber = manifest.getLong("runNumber"),
                 commitSha = manifest.getString("commitSha"),
                 apkAssetName = apkAssetName,
-                apkDownloadUrl = releaseAssetUrl(tagName, apkAssetName),
+                apkDownloadUrl = apkDownloadUrl,
                 apkSha256 = normalizeDigest(manifest.getString("apkSha256")),
                 certificateSha256 = normalizeDigest(manifest.getString("certificateSha256"))
             )
         )
-    }
-
-    private fun resolveLatestReleaseTagFromGithubWeb(): String {
-        val connection = openConnection(LATEST_RELEASE_WEB, githubApi = false, accept = HTML_ACCEPT)
-        try {
-            ensureSuccessful(connection)
-            val finalUrl = connection.url.toString()
-            val tag = RELEASE_TAG_REGEX.find(finalUrl)?.groupValues?.getOrNull(1)
-                ?: error("GitHub latest-release redirect did not resolve to a versioned release tag.")
-            checkSafeReleasePart(tag, "release tag")
-            return tag
-        } finally {
-            connection.disconnect()
-        }
     }
 
     private fun fetchLatestGreenReleaseFromApi(): GreenRelease {
@@ -85,6 +96,7 @@ class UpdateRepository(private val context: Context) {
             ?: error("The latest green release does not contain $UPDATE_MANIFEST_ASSET.")
         val manifest = JSONObject(readText(manifestUrl, githubApi = false, accept = JSON_ACCEPT))
         val apkAssetName = manifest.getString("apkAssetName")
+        checkSafeReleasePart(apkAssetName, "APK asset name")
         val apkUrl = assetUrl(releaseJson, apkAssetName)
             ?: error("The latest green release does not contain $apkAssetName.")
 
@@ -108,10 +120,13 @@ class UpdateRepository(private val context: Context) {
     private fun validateRelease(release: GreenRelease): GreenRelease {
         check(release.versionCode > 0L) { "The green release has an invalid versionCode." }
         check(release.versionName.isNotBlank()) { "The green release has an empty versionName." }
-        check(release.apkSha256.length == 64) { "The green release APK SHA-256 is invalid." }
-        check(release.certificateSha256.length == 64) { "The green release signing certificate SHA-256 is invalid." }
+        check(release.commitSha.matches(SHA_40)) { "The green release commit SHA is invalid." }
+        check(release.apkSha256.matches(SHA_256)) { "The green release APK SHA-256 is invalid." }
+        check(release.certificateSha256.matches(SHA_256)) { "The green release signing certificate SHA-256 is invalid." }
         checkSafeReleasePart(release.tagName, "release tag")
         checkSafeReleasePart(release.apkAssetName, "APK asset name")
+        check(isTrustedReleasePageUrl(release.releaseHtmlUrl)) { "The release page URL is not trusted." }
+        check(isTrustedReleaseAssetUrl(release.apkDownloadUrl, release.apkAssetName)) { "The APK release URL is not trusted." }
         return release
     }
 
@@ -121,16 +136,24 @@ class UpdateRepository(private val context: Context) {
         val target = File(updatesDir, "true-ram-usage-${release.versionCode}.apk")
         partial.delete()
 
-        val connection = openConnection(release.apkDownloadUrl, githubApi = false, accept = BINARY_ACCEPT)
-        try {
-            ensureSuccessful(connection)
-            connection.inputStream.use { input ->
-                partial.outputStream().buffered().use { output ->
-                    input.copyTo(output)
-                }
+        val candidates = listOf(
+            release.apkDownloadUrl,
+            latestAssetUrl(release.apkAssetName)
+        ).distinct()
+
+        val failures = mutableListOf<String>()
+        var downloaded = false
+        for (candidate in candidates) {
+            partial.delete()
+            val result = runCatching { download(candidate, partial) }
+            if (result.isSuccess) {
+                downloaded = true
+                break
             }
-        } finally {
-            connection.disconnect()
+            failures += "${hostOf(candidate)}: ${result.exceptionOrNull()?.message ?: "download failed"}"
+        }
+        check(downloaded && partial.isFile && partial.length() > 0L) {
+            "The latest green APK could not be downloaded. ${failures.joinToString("; ")}"
         }
 
         val actualSha = sha256(partial)
@@ -151,6 +174,18 @@ class UpdateRepository(private val context: Context) {
             partial.delete()
         }
         return target
+    }
+
+    private fun download(url: String, target: File) {
+        val connection = openConnection(url, githubApi = false, accept = BINARY_ACCEPT)
+        try {
+            ensureSuccessful(connection)
+            connection.inputStream.use { input ->
+                target.outputStream().buffered().use { output -> input.copyTo(output) }
+            }
+        } finally {
+            connection.disconnect()
+        }
     }
 
     fun verifyStaged(update: StagedUpdate): File {
@@ -209,10 +244,14 @@ class UpdateRepository(private val context: Context) {
         }.getOrDefault(SystemInstallLaunchResult.FAILED)
     }
 
-    fun openReleasePage(url: String): Boolean = runCatching {
-        val destination = url.ifBlank { LATEST_RELEASE_WEB }
+    fun openReleasePage(url: String): Boolean = openExternalUrl(url.ifBlank { LATEST_RELEASE_WEB })
+
+    fun openLatestApkDownload(url: String): Boolean =
+        openExternalUrl(url.ifBlank { LATEST_APK_URL })
+
+    private fun openExternalUrl(url: String): Boolean = runCatching {
         context.startActivity(
-            Intent(Intent.ACTION_VIEW, Uri.parse(destination)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
         true
     }.getOrDefault(false)
@@ -286,7 +325,9 @@ class UpdateRepository(private val context: Context) {
         val assets = releaseJson.getJSONArray("assets")
         for (index in 0 until assets.length()) {
             val asset = assets.getJSONObject(index)
-            if (asset.optString("name") == assetName) return asset.optString("browser_download_url").takeIf { it.isNotBlank() }
+            if (asset.optString("name") == assetName) {
+                return asset.optString("browser_download_url").takeIf { it.isNotBlank() }
+            }
         }
         return null
     }
@@ -297,9 +338,32 @@ class UpdateRepository(private val context: Context) {
         return "$RELEASE_DOWNLOAD_BASE/$tagName/$assetName"
     }
 
+    private fun latestAssetUrl(assetName: String): String {
+        checkSafeReleasePart(assetName, "release asset name")
+        return "$LATEST_DOWNLOAD_BASE/$assetName"
+    }
+
     private fun checkSafeReleasePart(value: String, label: String) {
         check(SAFE_RELEASE_PART.matches(value)) { "The $label returned by GitHub is not valid." }
     }
+
+    private fun isTrustedReleasePageUrl(value: String): Boolean = runCatching {
+        val uri = URI(value)
+        uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals("github.com", ignoreCase = true) &&
+            uri.path.startsWith("/tbzmike/True-ram-usage/releases/")
+    }.getOrDefault(false)
+
+    private fun isTrustedReleaseAssetUrl(value: String, assetName: String): Boolean = runCatching {
+        val uri = URI(value)
+        val path = uri.path
+        uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals("github.com", ignoreCase = true) &&
+            path.startsWith("/tbzmike/True-ram-usage/releases/") &&
+            path.endsWith("/$assetName")
+    }.getOrDefault(false)
+
+    private fun hostOf(value: String): String = runCatching { URI(value).host ?: value }.getOrDefault(value)
 
     private fun readText(url: String, githubApi: Boolean, accept: String): String {
         val connection = openConnection(url, githubApi, accept)
@@ -347,17 +411,21 @@ class UpdateRepository(private val context: Context) {
     private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
     companion object {
-        private const val LATEST_RELEASE_WEB = "https://github.com/tbzmike/True-ram-usage/releases/latest"
+        private const val REPOSITORY_WEB = "https://github.com/tbzmike/True-ram-usage"
+        private const val LATEST_RELEASE_WEB = "$REPOSITORY_WEB/releases/latest"
         private const val LATEST_RELEASE_API = "https://api.github.com/repos/tbzmike/True-ram-usage/releases/latest"
-        private const val RELEASE_TAG_BASE = "https://github.com/tbzmike/True-ram-usage/releases/tag"
-        private const val RELEASE_DOWNLOAD_BASE = "https://github.com/tbzmike/True-ram-usage/releases/download"
+        private const val RELEASE_TAG_BASE = "$REPOSITORY_WEB/releases/tag"
+        private const val RELEASE_DOWNLOAD_BASE = "$REPOSITORY_WEB/releases/download"
+        private const val LATEST_DOWNLOAD_BASE = "$REPOSITORY_WEB/releases/latest/download"
         private const val UPDATE_MANIFEST_ASSET = "update.json"
+        private const val LATEST_MANIFEST_URL = "$LATEST_DOWNLOAD_BASE/$UPDATE_MANIFEST_ASSET"
+        private const val LATEST_APK_URL = "$LATEST_DOWNLOAD_BASE/true-ram-usage.apk"
         private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
-        private const val HTML_ACCEPT = "text/html,application/xhtml+xml"
         private const val JSON_ACCEPT = "application/json,text/plain;q=0.9,*/*;q=0.8"
         private const val GITHUB_JSON_ACCEPT = "application/vnd.github+json"
         private const val BINARY_ACCEPT = "application/octet-stream"
-        private val RELEASE_TAG_REGEX = Regex("/releases/tag/([^/?#]+)")
         private val SAFE_RELEASE_PART = Regex("[A-Za-z0-9._-]+")
+        private val SHA_40 = Regex("[0-9a-fA-F]{40}")
+        private val SHA_256 = Regex("[0-9a-f]{64}")
     }
 }
