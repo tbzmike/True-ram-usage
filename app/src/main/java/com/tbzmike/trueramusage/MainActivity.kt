@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.tbzmike.trueramusage.ui.AggressiveReclaimOverlay
 import com.tbzmike.trueramusage.ui.MemoryViewModel
 import com.tbzmike.trueramusage.ui.TrueRamApp
 import com.tbzmike.trueramusage.ui.UpdateOverlay
@@ -27,6 +28,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             Box(Modifier.fillMaxSize()) {
                 TrueRamApp(memoryViewModel)
+                AggressiveReclaimOverlay(
+                    memoryViewModel,
+                    Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(20.dp)
+                )
                 UpdateOverlay(
                     updateViewModel,
                     Modifier
