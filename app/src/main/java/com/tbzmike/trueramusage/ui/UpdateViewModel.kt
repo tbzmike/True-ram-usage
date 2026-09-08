@@ -26,6 +26,9 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
     var automaticUpdatesEnabled by mutableStateOf(preferences.automaticUpdatesEnabled)
         private set
 
+    var automaticInstallEnabled by mutableStateOf(preferences.automaticInstallEnabled)
+        private set
+
     var latestRelease by mutableStateOf<GreenRelease?>(null)
         private set
 
@@ -58,9 +61,19 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
         preferences.automaticUpdatesEnabled = enabled
         UpdateScheduler.apply(getApplication(), enabled)
         message = if (enabled) {
-            "Automatic green-build checks are enabled. Verified updates can install unattended when root has previously been granted."
+            "Automatic green-build checks are enabled. New verified builds are downloaded and staged automatically."
         } else {
-            "Automatic update checks are disabled. Manual checks remain available."
+            "Automatic update checks are disabled. Manual checks remain available in Settings."
+        }
+    }
+
+    fun setAutomaticInstall(enabled: Boolean) {
+        automaticInstallEnabled = enabled
+        preferences.automaticInstallEnabled = enabled
+        message = if (enabled) {
+            "Automatic installation is enabled. Background updates will install unattended only when root was previously granted and APK verification passes."
+        } else {
+            "Automatic installation is disabled. Automatic checks can still download and stage verified updates for manual installation."
         }
     }
 
@@ -174,7 +187,9 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
         preferences.stage(staged)
         stagedUpdate = staged
 
-        val shouldTryUnattended = automatic && preferences.rootPreviouslyGranted
+        val shouldTryUnattended = automatic &&
+            automaticInstallEnabled &&
+            preferences.rootPreviouslyGranted
         if (shouldTryUnattended) {
             message = "Verified green build ${release.versionName}; installing with previously granted root access…"
             val result = withContext(Dispatchers.IO) { repository.installWithRoot(apk) }
@@ -183,7 +198,7 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
                 stagedUpdate = null
                 message = result.message
             } else {
-                message = "Update ${release.versionName} is verified and staged. Unattended root installation was unavailable; install it manually from Updates."
+                message = "Update ${release.versionName} is verified and staged. Unattended root installation was unavailable; install it manually from Settings."
             }
             return
         }
@@ -191,7 +206,11 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
         if (!automatic) {
             installStaged()
         } else {
-            message = "Update ${release.versionName} is verified and staged. Grant root once for unattended future updates, or install it manually from Updates."
+            message = if (automaticInstallEnabled) {
+                "Update ${release.versionName} is verified and staged. Root was not available for unattended installation; install it manually from Settings."
+            } else {
+                "Update ${release.versionName} is verified and staged for manual installation from Settings."
+            }
         }
     }
 
