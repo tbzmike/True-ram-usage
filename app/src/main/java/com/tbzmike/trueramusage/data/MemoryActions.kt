@@ -33,9 +33,12 @@ class MemoryActions(
         )
     }
 
-    fun closeApp(packageName: String, isSystemApp: Boolean): MemoryActionResult {
+    fun closeApp(packageName: String, isSystemApp: Boolean, ownPackageName: String): MemoryActionResult {
         if (!rootAccess.isGranted()) {
-            return MemoryActionResult(false, "Root access is required to close the app and release its ZRAM pages.")
+            return MemoryActionResult(false, "Root access is required to close the app and release its RAM/ZRAM pages.")
+        }
+        if (packageName == ownPackageName) {
+            return MemoryActionResult(false, "True RAM Usage cannot force-stop itself while it is measuring memory.")
         }
         if (isSystemApp) {
             return MemoryActionResult(false, "System apps are protected from this action.")
@@ -50,7 +53,7 @@ class MemoryActions(
         ) ?: return MemoryActionResult(false, "The root command could not be started.")
 
         return if (result.success) {
-            MemoryActionResult(true, "App closed. Its swapped pages are being released from kernel ZRAM.")
+            MemoryActionResult(true, "App closed. Android is releasing its physical-RAM and swapped pages.")
         } else {
             MemoryActionResult(false, "Android did not allow the app to be force-stopped.")
         }
@@ -67,37 +70,51 @@ class MemoryActions(
             .filter { it != ownPackageName }
             .distinct()
 
-        if (targets.isEmpty()) {
-            return MemoryActionResult(false, "No closable user apps with swapped pages were found.")
-        }
-        if (targets.any { !isSafePackageName(it) }) {
-            return MemoryActionResult(false, "One or more package names could not be validated safely.")
+        return closeTargets(
+            targets = targets,
+            emptyMessage = "No closable user apps with swapped pages were found.",
+            successLabel = "user apps that had memory in ZRAM/swap"
+        )
+    }
+
+    fun closeAllUserApps(apps: List<RunningAppUsage>, ownPackageName: String): MemoryActionResult {
+        if (!rootAccess.isGranted()) {
+            return MemoryActionResult(false, "Root access is required to close running user apps.")
         }
 
-        val dollar = '$'
-        val command = buildString {
-            append("failed=0; closed=0; ")
-            targets.forEach { packageName ->
-                append("if am force-stop --user current ")
-                append(shellQuote(packageName))
-                append(" >/dev/null 2>&1; then closed=${dollar}((closed+1)); else failed=${dollar}((failed+1)); fi; ")
-            }
-            append("printf 'CLOSED=%s FAILED=%s\\n' \"${dollar}closed\" \"${dollar}failed\"")
+        val targets = apps
+            .filterNot { it.isSystemApp }
+            .map { it.packageName }
+            .filter { it != ownPackageName }
+            .distinct()
+
+        return closeTargets(
+            targets = targets,
+            emptyMessage = "No closable running user apps were found.",
+            successLabel = "running user apps"
+        )
+    }
+
+    fun reclaimFileCaches(): MemoryActionResult {
+        if (!rootAccess.isGranted()) {
+            return MemoryActionResult(false, "Root access is required to reclaim kernel/file caches.")
         }
 
-        val result = rootAccess.runResult(command, timeoutSeconds = 45)
-            ?: return MemoryActionResult(false, "The bulk close command could not be started.")
-        if (result.timedOut) {
-            return MemoryActionResult(false, "Closing all ZRAM apps timed out before Android finished processing them.")
-        }
-
-        val closed = Regex("CLOSED=(\\d+)").find(result.output)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val failed = Regex("FAILED=(\\d+)").find(result.output)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val result = rootAccess.runResult(
+            "sync; if (echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null; then echo OK; else echo DROP_CACHES_FAILED; exit 1; fi",
+            timeoutSeconds = 30
+        ) ?: return MemoryActionResult(false, "The cache-reclaim command could not be started.")
 
         return when {
-            closed > 0 && failed == 0 -> MemoryActionResult(true, "Closed $closed user apps that had memory in ZRAM.")
-            closed > 0 -> MemoryActionResult(true, "Closed $closed user apps; $failed could not be force-stopped.")
-            else -> MemoryActionResult(false, "Android did not close any of the selected apps.")
+            result.timedOut -> MemoryActionResult(false, "Cache reclaim timed out before the kernel confirmed completion.")
+            result.success && result.output.contains("OK") -> MemoryActionResult(
+                true,
+                "Clean page cache and reclaimable filesystem metadata were requested for release. Anonymous app memory and required kernel memory were not discarded."
+            )
+            else -> MemoryActionResult(
+                false,
+                "This kernel or SELinux policy did not allow /proc/sys/vm/drop_caches to be written. No memory-tuning values were changed."
+            )
         }
     }
 
@@ -112,7 +129,7 @@ class MemoryActions(
         if (!safety.canClear) {
             return MemoryActionResult(
                 false,
-                "Not enough available physical RAM to clear ZRAM safely. Free more RAM first."
+                "The safety estimate does not show enough available physical RAM to cycle ZRAM. Close apps or reclaim caches first."
             )
         }
 
@@ -142,6 +159,43 @@ class MemoryActions(
             true,
             "Kernel ZRAM was cycled successfully. Android may begin swapping inactive pages into it again immediately."
         )
+    }
+
+    private fun closeTargets(
+        targets: List<String>,
+        emptyMessage: String,
+        successLabel: String
+    ): MemoryActionResult {
+        if (targets.isEmpty()) return MemoryActionResult(false, emptyMessage)
+        if (targets.any { !isSafePackageName(it) }) {
+            return MemoryActionResult(false, "One or more package names could not be validated safely.")
+        }
+
+        val dollar = '$'
+        val command = buildString {
+            append("failed=0; closed=0; ")
+            targets.forEach { packageName ->
+                append("if am force-stop --user current ")
+                append(shellQuote(packageName))
+                append(" >/dev/null 2>&1; then closed=${dollar}((closed+1)); else failed=${dollar}((failed+1)); fi; ")
+            }
+            append("printf 'CLOSED=%s FAILED=%s\\n' \"${dollar}closed\" \"${dollar}failed\"")
+        }
+
+        val result = rootAccess.runResult(command, timeoutSeconds = 60)
+            ?: return MemoryActionResult(false, "The bulk close command could not be started.")
+        if (result.timedOut) {
+            return MemoryActionResult(false, "Closing apps timed out before Android finished processing them.")
+        }
+
+        val closed = Regex("CLOSED=(\\d+)").find(result.output)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val failed = Regex("FAILED=(\\d+)").find(result.output)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+
+        return when {
+            closed > 0 && failed == 0 -> MemoryActionResult(true, "Closed $closed $successLabel.")
+            closed > 0 -> MemoryActionResult(true, "Closed $closed $successLabel; $failed could not be force-stopped.")
+            else -> MemoryActionResult(false, "Android did not close any of the selected apps.")
+        }
     }
 
     private fun isSafePackageName(packageName: String): Boolean =
