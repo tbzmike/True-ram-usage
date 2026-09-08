@@ -5,7 +5,9 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -39,11 +41,15 @@ fun AggressiveReclaimOverlay(vm: MemoryViewModel, modifier: Modifier = Modifier)
         else -> lightColorScheme()
     }
     var open by remember { mutableStateOf(false) }
-    var confirm by remember { mutableStateOf(false) }
 
     MaterialTheme(colorScheme = colors) {
         Button(
-            onClick = { open = true },
+            onClick = {
+                open = true
+                if (vm.rootState == RootState.GRANTED && !vm.actionInProgress) {
+                    vm.aggressiveBootLikeReclaim()
+                }
+            },
             enabled = !vm.actionInProgress,
             modifier = modifier
         ) {
@@ -53,33 +59,50 @@ fun AggressiveReclaimOverlay(vm: MemoryViewModel, modifier: Modifier = Modifier)
         if (open) {
             AlertDialog(
                 onDismissRequest = { if (!vm.actionInProgress) open = false },
-                title = { Text("Aggressive boot-like reclaim") },
+                title = { Text(if (vm.actionInProgress) "Aggressive reclaim running" else "Aggressive reclaim") },
                 text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 620.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         Text(
-                            "This is intended for unusually overused RAM when you would otherwise reboot. It cannot make RAM literally identical to a reboot because Android and the kernel keep required services and memory resident.",
+                            "This mode intentionally force-stops every installed third-party app for the current Android user except True RAM Usage itself, runs repeated Android background kill passes, reclaims clean caches, compacts memory, then tries to empty all active swap/ZRAM when the fresh headroom check allows it.",
                             fontWeight = FontWeight.SemiBold
                         )
-                        Text("The operation performs a fresh process scan, force-stops current non-system user apps, kills remaining background processes, syncs storage, drops clean page/file caches, requests kernel memory compaction, then tries to disable all active swap/ZRAM at the same time and re-enable every device with its recorded priority.")
-                        Text("Before swapoff, True RAM Usage re-reads MemAvailable and current swap usage. If there is not enough physical headroom for every swapped page plus the existing safety reserve, the swap-clear phase is blocked instead of risking an OOM or forced reboot.")
-                        Text("Apps may reopen more slowly, background notifications/services from force-stopped user apps may remain stopped until those apps are launched again, and cache rebuilding can cause temporary I/O/CPU activity.", style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "Essential Android/kernel processes are not blindly SIGKILLed. Android's own kill-all path is used for remaining processes it considers background-killable so the phone can stay operational while the reclaim completes and verifies its result.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
 
                         when {
-                            vm.rootState != RootState.GRANTED -> Text("Root access must be granted from the main screen before this operation can run.", color = MaterialTheme.colorScheme.error)
+                            vm.rootState != RootState.GRANTED -> {
+                                Text(
+                                    "Root access is required. Grant root in Settings, then press Aggressive reclaim again.",
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
                             vm.aggressiveReclaimStage != null -> {
                                 CircularProgressIndicator()
                                 Text(vm.aggressiveReclaimStage ?: "Working…", color = MaterialTheme.colorScheme.primary)
                             }
-                            else -> Button(
-                                onClick = { confirm = true },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Reclaim physical RAM + clear all swap/ZRAM")
+                            vm.aggressiveReclaimReport == null && vm.actionError == null -> {
+                                Text("The reclaim action starts immediately when this button is pressed with root granted.")
                             }
                         }
 
                         vm.aggressiveReclaimReport?.let { report ->
                             Text("Verified result", fontWeight = FontWeight.Bold)
+                            ReclaimValue("User packages targeted", report.userAppsTargeted.toString())
+                            ReclaimValue("Rejected force-stop commands", report.failedForceStopCommands.toString())
+                            ReclaimValue("Background kill-all passes confirmed", report.killAllPassesSucceeded.toString())
+                            ReclaimValue("Restart cleanup sweep", if (report.appSweepRepeated) "Yes" else "No")
+                            ReclaimValue(
+                                "Mapped non-system apps still running",
+                                report.remainingMappedUserApps?.toString() ?: "Verification unavailable"
+                            )
                             ReclaimValue("Used RAM before", formatReclaimBytes(report.beforeUsedRamBytes))
                             ReclaimValue("Used RAM after", formatReclaimBytes(report.afterUsedRamBytes))
                             ReclaimValue("Available RAM before", formatReclaimBytes(report.beforeAvailableRamBytes))
@@ -99,35 +122,17 @@ fun AggressiveReclaimOverlay(vm: MemoryViewModel, modifier: Modifier = Modifier)
                             Text(report.swapMessage, style = MaterialTheme.typography.bodySmall)
                         }
 
+                        vm.actionMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
                         vm.actionError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = { if (!vm.actionInProgress) open = false }) {
-                        Text("Close")
+                    TextButton(
+                        onClick = { open = false },
+                        enabled = !vm.actionInProgress
+                    ) {
+                        Text(if (vm.actionInProgress) "Working…" else "Close")
                     }
-                }
-            )
-        }
-
-        if (confirm) {
-            AlertDialog(
-                onDismissRequest = { confirm = false },
-                title = { Text("Run aggressive reclaim now?") },
-                text = {
-                    Text("This will force-stop current non-system user apps and may temporarily disable every active swap/ZRAM device. True RAM Usage itself and mapped system apps are protected from the force-stop list. The swap phase runs only if the fresh safety check has enough physical RAM headroom.")
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        confirm = false
-                        open = true
-                        vm.aggressiveBootLikeReclaim()
-                    }) {
-                        Text("Run aggressive reclaim")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { confirm = false }) { Text("Cancel") }
                 }
             )
         }
