@@ -19,6 +19,7 @@ import com.tbzmike.trueramusage.data.RunningAppUsage
 import com.tbzmike.trueramusage.data.ThemeMode
 import com.tbzmike.trueramusage.data.UnmappedProcessUsage
 import com.tbzmike.trueramusage.data.ZramClearSafety
+import com.tbzmike.trueramusage.update.UpdatePreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -32,6 +33,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private val appSwapRepository = AppSwapRepository(application, rootAccess)
     private val memoryActions = MemoryActions(rootAccess)
     private val preferences = AppPreferences(application)
+    private val updatePreferences = UpdatePreferences(application)
     private val ownPackageName = application.packageName
     private var monitoringJob: Job? = null
 
@@ -122,6 +124,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
             rootRequestInProgress = true
             rootState = withContext(Dispatchers.IO) { rootAccess.request() }
             rootRequestInProgress = false
+            if (rootState == RootState.GRANTED) updatePreferences.rootPreviouslyGranted = true
             refreshMemory()
             if (rootState == RootState.GRANTED) refreshApps()
         }
