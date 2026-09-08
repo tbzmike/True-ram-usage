@@ -11,8 +11,8 @@ android {
         applicationId = "com.tbzmike.trueramusage"
         minSdk = 26
         targetSdk = 37
-        versionCode = 10
-        versionName = "0.5.1"
+        versionCode = 11
+        versionName = "0.6.0"
     }
 
     signingConfigs {
@@ -56,8 +56,10 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.core:core:1.19.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
