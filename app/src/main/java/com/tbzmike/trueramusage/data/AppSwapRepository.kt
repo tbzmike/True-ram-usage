@@ -15,68 +15,74 @@ class AppSwapRepository(
         Os.sysconf(OsConstants._SC_CLK_TCK)
     }.getOrDefault(0L).coerceAtLeast(0L)
 
-    fun readRunningApps(): List<RunningAppUsage> {
+    fun readUsage(): ProcessScanResult {
         check(rootAccess.isGranted()) { "Root access is required for running-app memory details." }
 
         val rawStatuses = readAllProcessStatuses()
-        if (rawStatuses.isEmpty()) return emptyList()
+        if (rawStatuses.isEmpty()) return ProcessScanResult(emptyList(), emptyList())
+
+        val pids = rawStatuses.map { it.pid }
+        val processNames = readProcessNames(pids)
+        val proportionalByPid = readProportionalMemory(pids)
+        val statsByPid = readProcessStats(pids)
+        val uptimeSeconds = readUptimeSeconds()
 
         val packagesByUid = mutableMapOf<Int, List<String>>()
         val packageInfoCache = mutableMapOf<String, ApplicationInfo?>()
+        val resolvedProcesses = mutableListOf<ResolvedProcess>()
+        val unmappedProcesses = mutableListOf<UnmappedProcessUsage>()
 
-        val ambiguousPids = rawStatuses.filter { raw ->
-            val packages = packagesByUid.getOrPut(raw.uid) { packagesForUid(raw.uid) }
-            packages.size > 1
-        }.map { it.pid }
-        val ambiguousNames = readProcessNames(ambiguousPids)
+        rawStatuses.forEach { raw ->
+            val commandName = processNames[raw.pid].orEmpty()
+            val stat = statsByPid[raw.pid]
+            val displayProcessName = commandName.ifBlank { stat?.processName.orEmpty() }.ifBlank { "pid-${raw.pid}" }
+            val timing = calculateTiming(stat, uptimeSeconds)
+            val proportional = proportionalByPid[raw.pid]
+            val processUsage = ProcessSwapUsage(
+                pid = raw.pid,
+                uid = raw.uid,
+                processName = displayProcessName,
+                swapBytes = raw.swapKb * 1024L,
+                swapPssBytes = proportional?.swapPssKb?.times(1024L) ?: 0L,
+                rssBytes = raw.rssKb * 1024L,
+                pssBytes = proportional?.pssKb?.times(1024L) ?: 0L,
+                runningSeconds = timing.runningSeconds,
+                cpuTimeSeconds = timing.cpuTimeSeconds,
+                proportionalMetricsAvailable = proportional != null,
+                mappedFromProcessName = false
+            )
 
-        val resolved = rawStatuses.mapNotNull { raw ->
-            val packages = packagesByUid.getOrPut(raw.uid) { packagesForUid(raw.uid) }
-            if (packages.isEmpty()) return@mapNotNull null
+            val resolution = resolvePackage(
+                raw = raw,
+                processName = commandName,
+                packagesByUid = packagesByUid,
+                packageInfoCache = packageInfoCache
+            )
 
-            val packageName = when {
-                packages.size == 1 -> packages.single()
-                else -> {
-                    val processName = ambiguousNames[raw.pid].orEmpty()
-                    packages.firstOrNull { candidate ->
-                        processName == candidate || processName.startsWith("$candidate:")
-                    }
-                }
-            } ?: return@mapNotNull null
-
-            val appInfo = packageInfoCache.getOrPut(packageName) { getApplicationInfo(packageName) }
-                ?: return@mapNotNull null
-            if (appInfo.uid != raw.uid) return@mapNotNull null
-
-            ResolvedRawProcess(raw, packageName, appInfo)
-        }
-
-        if (resolved.isEmpty()) return emptyList()
-
-        val statsByPid = readProcessStats(resolved.map { it.raw.pid })
-        val uptimeSeconds = readUptimeSeconds()
-
-        val processRows = resolved.map { item ->
-            val stats = statsByPid[item.raw.pid]
-            val timing = calculateTiming(stats, uptimeSeconds)
-            ResolvedProcess(
-                packageName = item.packageName,
-                appInfo = item.appInfo,
-                process = ProcessSwapUsage(
-                    pid = item.raw.pid,
-                    uid = item.raw.uid,
-                    processName = stats?.processName.orEmpty(),
-                    swapBytes = item.raw.swapKb * 1024L,
-                    swapPssBytes = 0L,
-                    rssBytes = item.raw.rssKb * 1024L,
-                    pssBytes = 0L,
-                    runningSeconds = timing.runningSeconds,
-                    cpuTimeSeconds = timing.cpuTimeSeconds
+            if (resolution == null) {
+                unmappedProcesses += UnmappedProcessUsage(
+                    pid = processUsage.pid,
+                    uid = processUsage.uid,
+                    processName = processUsage.processName,
+                    residentBytes = processUsage.rssBytes,
+                    pssBytes = processUsage.pssBytes,
+                    swapBytes = processUsage.swapBytes,
+                    swapPssBytes = processUsage.swapPssBytes,
+                    proportionalMetricsAvailable = processUsage.proportionalMetricsAvailable,
+                    runningSeconds = processUsage.runningSeconds,
+                    cpuTimeSeconds = processUsage.cpuTimeSeconds
                 )
+                return@forEach
+            }
+
+            resolvedProcesses += ResolvedProcess(
+                packageName = resolution.packageName,
+                appInfo = resolution.appInfo,
+                process = processUsage.copy(mappedFromProcessName = resolution.mappedFromProcessName)
             )
         }
 
-        return processRows
+        val apps = resolvedProcesses
             .groupBy { it.packageName }
             .map { (packageName, rows) ->
                 val appInfo = rows.first().appInfo
@@ -87,36 +93,85 @@ class AppSwapRepository(
                         .getOrDefault(packageName),
                     uid = appInfo.uid,
                     residentBytes = processes.sumOf { it.rssBytes },
+                    pssBytes = processes.sumOf { it.pssBytes },
                     swapBytes = processes.sumOf { it.swapBytes },
+                    swapPssBytes = processes.sumOf { it.swapPssBytes },
                     processCount = processes.size,
                     isSystemApp = appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0,
                     runningSeconds = processes.maxOfOrNull { it.runningSeconds } ?: 0L,
                     cpuTimeSeconds = processes.sumOf { it.cpuTimeSeconds },
-                    processes = processes.sortedByDescending { it.rssBytes + it.swapBytes }
+                    proportionalMetricsAvailable = processes.all { it.proportionalMetricsAvailable },
+                    isolatedProcessCount = processes.count { it.mappedFromProcessName },
+                    processes = processes.sortedByDescending { it.attributedRamBytes + it.attributedSwapBytes }
                 )
             }
-            .sortedByDescending { it.residentBytes + it.swapBytes }
+            .sortedByDescending { it.attributedRamBytes + it.attributedSwapBytes }
+
+        val unmapped = unmappedProcesses
+            .sortedByDescending { it.attributedRamBytes + it.attributedSwapBytes }
+
+        return ProcessScanResult(apps = apps, unmappedProcesses = unmapped)
     }
 
-    fun readAppsUsingSwap(): List<AppSwapUsage> = readRunningApps()
-        .filter { it.swapBytes > 0L }
+    fun readRunningApps(): List<RunningAppUsage> = readUsage().apps
+
+    fun readAppsUsingSwap(): List<AppSwapUsage> = readUsage().apps
+        .filter { it.attributedSwapBytes > 0L }
         .map { app ->
             AppSwapUsage(
                 packageName = app.packageName,
                 label = app.label,
                 uid = app.uid,
-                attributedSwapBytes = app.swapBytes,
+                attributedSwapBytes = app.attributedSwapBytes,
                 rawSwapBytes = app.swapBytes,
                 residentBytes = app.residentBytes,
-                pssBytes = 0L,
+                pssBytes = app.pssBytes,
                 processCount = app.processCount,
                 isSystemApp = app.isSystemApp,
                 processes = app.processes,
                 runningSeconds = app.runningSeconds,
-                cpuTimeSeconds = app.cpuTimeSeconds
+                cpuTimeSeconds = app.cpuTimeSeconds,
+                proportionalMetricsAvailable = app.proportionalMetricsAvailable,
+                isolatedProcessCount = app.isolatedProcessCount
             )
         }
         .sortedByDescending { it.attributedSwapBytes }
+
+    private fun resolvePackage(
+        raw: RawProcessStatus,
+        processName: String,
+        packagesByUid: MutableMap<Int, List<String>>,
+        packageInfoCache: MutableMap<String, ApplicationInfo?>
+    ): PackageResolution? {
+        val packages = packagesByUid.getOrPut(raw.uid) { packagesForUid(raw.uid) }
+        val packageName = when {
+            packages.size == 1 -> packages.single()
+            packages.size > 1 -> packages.firstOrNull { candidate ->
+                processName == candidate || processName.startsWith("$candidate:")
+            }
+            else -> packageFromProcessName(processName, packageInfoCache)
+        } ?: return null
+
+        val appInfo = packageInfoCache.getOrPut(packageName) { getApplicationInfo(packageName) }
+            ?: return null
+        val mappedFromProcessName = packages.isEmpty()
+        if (!mappedFromProcessName && appInfo.uid != raw.uid) return null
+
+        return PackageResolution(packageName, appInfo, mappedFromProcessName)
+    }
+
+    private fun packageFromProcessName(
+        processName: String,
+        packageInfoCache: MutableMap<String, ApplicationInfo?>
+    ): String? {
+        if (processName.isBlank()) return null
+        val base = processName.substringBefore(':').trim()
+        val candidates = listOf(base, processName.trim()).distinct()
+        return candidates.firstOrNull { candidate ->
+            candidate.matches(Regex("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")) &&
+                packageInfoCache.getOrPut(candidate) { getApplicationInfo(candidate) } != null
+        }
+    }
 
     private fun readAllProcessStatuses(): List<RawProcessStatus> {
         val result = rootAccess.runResult(
@@ -157,6 +212,49 @@ class AppSwapRepository(
         }
     }
 
+    private fun readProportionalMemory(pids: List<Int>): Map<Int, ProportionalMemory> {
+        if (pids.isEmpty()) return emptyMap()
+        val pidList = pids.distinct().joinToString(" ")
+        val dollar = '$'
+        val script = "for pid in $pidList; do " +
+            "[ -r /proc/${dollar}pid/smaps_rollup ] || continue; " +
+            "printf 'PID=%s\\n' \"${dollar}pid\"; " +
+            "grep -E '^(Pss|SwapPss):' /proc/${dollar}pid/smaps_rollup 2>/dev/null || true; " +
+            "printf 'END\\n'; done"
+
+        val result = rootAccess.runResult(script, timeoutSeconds = 20) ?: return emptyMap()
+        if (!result.success || result.timedOut) return emptyMap()
+
+        val parsed = linkedMapOf<Int, MutableProportionalMemory>()
+        var currentPid: Int? = null
+        result.output.lineSequence().forEach { rawLine ->
+            val line = rawLine.trim()
+            when {
+                line.startsWith("PID=") -> {
+                    currentPid = line.substringAfter('=').toIntOrNull()
+                    currentPid?.let { parsed.getOrPut(it) { MutableProportionalMemory() } }
+                }
+                line == "END" -> currentPid = null
+                currentPid != null -> {
+                    val parts = line.split(Regex("\\s+"))
+                    val valueKb = parts.getOrNull(1)?.toLongOrNull() ?: return@forEach
+                    val target = parsed.getOrPut(currentPid!!) { MutableProportionalMemory() }
+                    when (parts.firstOrNull()) {
+                        "Pss:" -> {
+                            target.pssKb = valueKb
+                            target.hasPss = true
+                        }
+                        "SwapPss:" -> target.swapPssKb = valueKb
+                    }
+                }
+            }
+        }
+
+        return parsed.mapNotNull { (pid, values) ->
+            if (!values.hasPss) null else pid to ProportionalMemory(values.pssKb, values.swapPssKb)
+        }.toMap()
+    }
+
     private fun readProcessNames(pids: List<Int>): Map<Int, String> {
         if (pids.isEmpty()) return emptyMap()
         val pidList = pids.distinct().joinToString(" ")
@@ -166,7 +264,7 @@ class AppSwapRepository(
             "name=\$(tr '\\000' ' ' < /proc/${dollar}pid/cmdline 2>/dev/null | cut -d' ' -f1); " +
             "printf '%s\\t%s\\n' \"${dollar}pid\" \"${dollar}name\"; done"
 
-        val result = rootAccess.runResult(script, timeoutSeconds = 4) ?: return emptyMap()
+        val result = rootAccess.runResult(script, timeoutSeconds = 6) ?: return emptyMap()
         if (!result.success) return emptyMap()
         return result.output.lineSequence().mapNotNull { line ->
             val parts = line.split('\t', limit = 2)
@@ -229,8 +327,10 @@ class AppSwapRepository(
 
     private data class MutableProcessStatus(var uid: Int? = null, var swapKb: Long = 0L, var rssKb: Long = 0L)
     private data class RawProcessStatus(val pid: Int, val uid: Int, val swapKb: Long, val rssKb: Long)
-    private data class ResolvedRawProcess(val raw: RawProcessStatus, val packageName: String, val appInfo: ApplicationInfo)
+    private data class PackageResolution(val packageName: String, val appInfo: ApplicationInfo, val mappedFromProcessName: Boolean)
     private data class ResolvedProcess(val packageName: String, val appInfo: ApplicationInfo, val process: ProcessSwapUsage)
     private data class ProcessStat(val pid: Int, val processName: String, val cpuTicks: Long, val startTicks: Long)
     private data class ProcessTiming(val runningSeconds: Long, val cpuTimeSeconds: Double)
+    private data class ProportionalMemory(val pssKb: Long, val swapPssKb: Long)
+    private data class MutableProportionalMemory(var pssKb: Long = 0L, var swapPssKb: Long = 0L, var hasPss: Boolean = false)
 }
