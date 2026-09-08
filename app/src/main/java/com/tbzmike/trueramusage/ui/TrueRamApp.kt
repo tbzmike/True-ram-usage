@@ -6,6 +6,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -128,6 +131,15 @@ private fun AppScreen(vm: MemoryViewModel) {
             OverviewCharts(snapshot)
             RamSection(snapshot, vm.displayMode)
             MemoryBreakdownSection(snapshot, vm.displayMode)
+            if (vm.rootState == RootState.GRANTED) {
+                ProcessCoverageSection(
+                    snapshot,
+                    vm.runningApps,
+                    vm.unmappedProcesses,
+                    vm.appsScanInProgress,
+                    vm.appsScanError
+                )
+            }
             SwapSection(snapshot, vm.displayMode)
 
             if (snapshot.zramDevices.isEmpty()) {
@@ -313,10 +325,14 @@ private fun Donut(title: String, used: Long, total: Long, modifier: Modifier) {
 
 @Composable
 private fun RamSection(s: MemorySnapshot, mode: DisplayMode) {
+    val lowAvailableThreshold = max(512L * 1024L * 1024L, s.totalRamBytes / 10L)
     Section("Physical RAM", "${formatBytes(s.usedRamBytes)} of ${formatBytes(s.totalRamBytes)} used", mode == DisplayMode.DETAILED) {
         Value("Used", formatPercent(fraction(s.usedRamBytes, s.totalRamBytes).toDouble() * 100.0))
         Value("Available", formatBytes(s.availableRamBytes))
         if (s.zramPhysicalRamBytes > 0L) Value("Used by ZRAM itself", formatBytes(s.zramPhysicalRamBytes))
+        if (s.availableRamBytes < lowAvailableThreshold) {
+            Text("Low available physical RAM. Use the process scan and memory-breakdown sections before reclaiming so the remaining pressure can be identified.", color = MaterialTheme.colorScheme.error)
+        }
         if (mode == DisplayMode.DETAILED) Text("Used RAM is MemTotal minus MemAvailable. ZRAM's physical-RAM cost is already inside that used-RAM figure and is shown separately only to explain where part of it went.", style = MaterialTheme.typography.bodySmall)
     }
 }
@@ -343,6 +359,47 @@ private fun MemoryBreakdownSection(s: MemorySnapshot, mode: DisplayMode) {
             Value("Writeback", formatBytes(b.writebackBytes))
         }
         Text("These are direct /proc/meminfo counters and some categories overlap, so they should be diagnosed individually rather than added together as a second RAM total.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun ProcessCoverageSection(
+    s: MemorySnapshot,
+    apps: List<RunningAppUsage>,
+    unmapped: List<UnmappedProcessUsage>,
+    scanning: Boolean,
+    error: String?
+) {
+    val mappedRam = apps.sumOf { it.attributedRamBytes }
+    val nativeRam = unmapped.sumOf { it.attributedRamBytes }
+    val totalProcessRam = mappedRam + nativeRam
+    val difference = s.usedRamBytes - totalProcessRam
+    val summary = when {
+        scanning -> "Scanning process memory…"
+        error != null -> "Process scan unavailable"
+        apps.isEmpty() && unmapped.isEmpty() -> "Refresh process list to compare"
+        difference >= 0L -> "${formatBytes(difference)} used RAM not attributed to process pages"
+        else -> "Process estimate exceeds system-used RAM by ${formatBytes(-difference)}"
+    }
+
+    Section("Process accounting coverage", summary, false) {
+        when {
+            scanning -> Text("Reading proportional process memory counters…")
+            error != null -> InfoCard("Coverage unavailable", error)
+            apps.isEmpty() && unmapped.isEmpty() -> Text("Refresh the running-app list after granting root. This comparison helps separate app/native-process memory from kernel, cache and other non-process memory.")
+            else -> {
+                Value("Mapped app process RAM", formatBytes(mappedRam))
+                Value("Native / unmapped process RAM", formatBytes(nativeRam))
+                Value("Total attributed process RAM", formatBytes(totalProcessRam))
+                Value("System used physical RAM", formatBytes(s.usedRamBytes))
+                if (difference >= 0L) {
+                    Value("Not attributed to process pages", formatBytes(difference))
+                } else {
+                    Value("Process estimate above system used", formatBytes(-difference))
+                }
+                Text("A positive gap can contain kernel memory, caches, shmem and other accounting categories. A negative gap can occur when one or more processes fall back to RSS, which can double-count shared pages. This is a diagnostic comparison, not a second RAM total.", style = MaterialTheme.typography.bodySmall)
+            }
+        }
     }
 }
 
@@ -424,7 +481,14 @@ private fun AppsInSwapSection(
             apps.isEmpty() -> Text("No mapped app currently reports attributable swapped pages.")
             else -> {
                 if (apps.any { !it.isSystemApp }) Button(onClick = closeAll, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Close all user apps from ${if (zramOnly) "ZRAM" else "swap"}") }
-                apps.forEach { AppSwapRow(it, zramOnly, mode, busy, close) }
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(apps, key = { it.packageName }) { app ->
+                        AppSwapRow(app, zramOnly, mode, busy, close)
+                    }
+                }
             }
         }
         Button(onClick = refresh, enabled = !scanning && !busy, modifier = Modifier.fillMaxWidth()) { Text(if (scanning) "Scanning…" else "Refresh app list") }
@@ -469,7 +533,14 @@ private fun RunningAppsSection(apps: List<RunningAppUsage>, scanning: Boolean, e
             scanning -> Text("Reading RAM, PSS, swap, runtime and CPU counters…")
             error != null -> InfoCard("Running-app scan failed", error)
             apps.isEmpty() -> Text("No running Android apps could be mapped from the current process table.")
-            else -> apps.forEach { RunningRow(it, zramOnly, mode) }
+            else -> LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(apps, key = { it.packageName }) { app ->
+                    RunningRow(app, zramOnly, mode)
+                }
+            }
         }
         Button(onClick = refresh, enabled = !scanning, modifier = Modifier.fillMaxWidth()) { Text(if (scanning) "Scanning…" else "Refresh running apps") }
     }
@@ -509,7 +580,7 @@ private fun UnmappedProcessesSection(
 ) {
     if (mode != DisplayMode.DETAILED) return
     val nonZero = processes.filter { it.attributedRamBytes > 0L || it.attributedSwapBytes > 0L }
-    val shown = nonZero.take(40)
+    val shown = nonZero.take(100)
     val total = nonZero.sumOf { it.attributedRamBytes }
     val summary = when {
         scanning -> "Scanning…"
@@ -519,8 +590,17 @@ private fun UnmappedProcessesSection(
     }
     Section("Native / unmapped processes", summary, false) {
         Text("These processes are visible in /proc but could not be safely assigned to an installed Android package. This is important when RAM remains high after user apps are closed.", style = MaterialTheme.typography.bodySmall)
-        shown.forEach { UnmappedRow(it, zramOnly) }
-        if (nonZero.size > shown.size) Text("Showing the 40 largest of ${nonZero.size} non-zero unmapped processes.", style = MaterialTheme.typography.bodySmall)
+        if (shown.isNotEmpty()) {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(shown, key = { it.pid }) { process ->
+                    UnmappedRow(process, zramOnly)
+                }
+            }
+        }
+        if (nonZero.size > shown.size) Text("Showing the 100 largest of ${nonZero.size} non-zero unmapped processes.", style = MaterialTheme.typography.bodySmall)
     }
 }
 
