@@ -12,8 +12,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.tbzmike.trueramusage.ui.AggressiveReclaimOverlay
 import com.tbzmike.trueramusage.ui.MemoryViewModel
+import com.tbzmike.trueramusage.ui.SettingsOverlay
 import com.tbzmike.trueramusage.ui.TrueRamApp
-import com.tbzmike.trueramusage.ui.UpdateOverlay
 import com.tbzmike.trueramusage.ui.UpdateViewModel
 import com.tbzmike.trueramusage.update.UpdatePreferences
 import com.tbzmike.trueramusage.update.UpdateScheduler
@@ -34,7 +34,8 @@ class MainActivity : ComponentActivity() {
                         .align(Alignment.BottomStart)
                         .padding(20.dp)
                 )
-                UpdateOverlay(
+                SettingsOverlay(
+                    memoryViewModel,
                     updateViewModel,
                     Modifier
                         .align(Alignment.BottomEnd)

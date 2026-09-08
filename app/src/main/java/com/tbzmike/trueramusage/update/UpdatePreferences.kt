@@ -9,6 +9,10 @@ class UpdatePreferences(context: Context) {
         get() = prefs.getBoolean(KEY_AUTOMATIC_UPDATES, true)
         set(value) { prefs.edit().putBoolean(KEY_AUTOMATIC_UPDATES, value).apply() }
 
+    var automaticInstallEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AUTOMATIC_INSTALL, true)
+        set(value) { prefs.edit().putBoolean(KEY_AUTOMATIC_INSTALL, value).apply() }
+
     var rootPreviouslyGranted: Boolean
         get() = prefs.getBoolean(KEY_ROOT_PREVIOUSLY_GRANTED, false)
         set(value) { prefs.edit().putBoolean(KEY_ROOT_PREVIOUSLY_GRANTED, value).apply() }
@@ -52,6 +56,7 @@ class UpdatePreferences(context: Context) {
 
     companion object {
         private const val KEY_AUTOMATIC_UPDATES = "automatic_updates"
+        private const val KEY_AUTOMATIC_INSTALL = "automatic_install"
         private const val KEY_ROOT_PREVIOUSLY_GRANTED = "root_previously_granted"
         private const val KEY_LAST_AUTOMATIC_CHECK = "last_automatic_check"
         private const val KEY_STAGED_VERSION_CODE = "staged_version_code"

@@ -42,7 +42,7 @@ class UpdateWorker(
             )
             preferences.stage(stagedUpdate)
 
-            if (preferences.rootPreviouslyGranted) {
+            if (preferences.automaticInstallEnabled && preferences.rootPreviouslyGranted) {
                 val install = repository.installWithRoot(apk)
                 if (install.success) {
                     preferences.clearStaged()

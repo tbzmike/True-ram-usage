@@ -65,6 +65,7 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     private val updatePreferences = UpdatePreferences(application)
     private val ownPackageName = application.packageName
     private var monitoringJob: Job? = null
+    private var activityStarted = false
 
     var snapshot by mutableStateOf<MemorySnapshot?>(null)
         private set
@@ -119,18 +120,34 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     val themeMode: ThemeMode
         get() = themeModeState
 
+    private var automaticMemoryRefreshState by mutableStateOf(preferences.automaticMemoryRefreshEnabled)
+    val automaticMemoryRefreshEnabled: Boolean
+        get() = automaticMemoryRefreshState
+
+    private var memoryRefreshIntervalState by mutableStateOf(preferences.memoryRefreshIntervalMs)
+    val memoryRefreshIntervalMs: Long
+        get() = memoryRefreshIntervalState
+
     fun setMonitoringActive(active: Boolean) {
-        if (active) {
-            if (monitoringJob?.isActive == true) return
-            monitoringJob = viewModelScope.launch {
-                while (isActive) {
-                    refreshMemory()
-                    delay(2_000)
-                }
+        activityStarted = active
+        restartMonitoringLoop()
+    }
+
+    private fun restartMonitoringLoop() {
+        monitoringJob?.cancel()
+        monitoringJob = null
+        if (!activityStarted) return
+
+        if (!automaticMemoryRefreshState) {
+            monitoringJob = viewModelScope.launch { refreshMemory() }
+            return
+        }
+
+        monitoringJob = viewModelScope.launch {
+            while (isActive) {
+                refreshMemory()
+                delay(memoryRefreshIntervalState)
             }
-        } else {
-            monitoringJob?.cancel()
-            monitoringJob = null
         }
     }
 
@@ -142,6 +159,19 @@ class MemoryViewModel(application: Application) : AndroidViewModel(application) 
     fun setThemeMode(mode: ThemeMode) {
         themeModeState = mode
         preferences.themeMode = mode
+    }
+
+    fun setAutomaticMemoryRefresh(enabled: Boolean) {
+        automaticMemoryRefreshState = enabled
+        preferences.automaticMemoryRefreshEnabled = enabled
+        restartMonitoringLoop()
+    }
+
+    fun setMemoryRefreshInterval(intervalMs: Long) {
+        val normalized = AppPreferences.normalizeRefreshInterval(intervalMs)
+        memoryRefreshIntervalState = normalized
+        preferences.memoryRefreshIntervalMs = normalized
+        if (automaticMemoryRefreshState) restartMonitoringLoop()
     }
 
     fun refreshNow() {

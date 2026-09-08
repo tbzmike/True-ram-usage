@@ -13,7 +13,8 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 - Expose memory categories such as anonymous pages, cache, shmem, slab, kernel stacks, page tables and unevictable memory so abnormal kernel/system RAM use can be diagnosed.
 - Compare total attributed process RAM with system used RAM to expose the diagnostic gap that may be explained by kernel memory, caches, shmem or other non-process categories.
 - Provide guarded recovery actions: force-stop non-system user apps, reclaim clean file/kernel caches, cycle ZRAM, and run an explicitly aggressive boot-like reclaim that also attempts to empty every active swap device.
-- Minimize the monitor's own observer effect by stopping periodic kernel polling while the Activity is backgrounded and lazily composing long process lists.
+- Provide a real Settings surface for appearance, monitoring cadence, root access, manual updates and automatic-update behavior.
+- Minimize the monitor's own observer effect by stopping periodic kernel polling while the Activity is backgrounded, making the foreground refresh interval configurable, and lazily composing long process lists.
 - Publish every passed `main` build as the latest green GitHub Release and let the app retrieve verified updates directly from that release feed.
 - Never claim that physical RAM can be made literally empty or guaranteed to match a reboot; Android and the Linux kernel retain required services, kernel structures and caches and may immediately reuse freed memory.
 - Never claim a capability that the current device/kernel does not expose.
@@ -22,7 +23,26 @@ True RAM Usage is an Android memory-inspection and recovery-diagnostics app focu
 
 - Name: True RAM Usage
 - Package: `com.tbzmike.trueramusage`
-- Current development version: `0.7.0`
+- Current development version: `0.8.0`
+
+## Settings
+
+The floating **Settings** control is the central configuration and update surface. It is wired directly to the same persisted preferences and ViewModels used by the live monitor rather than keeping a separate copy of settings state.
+
+Settings currently includes:
+
+- **Display detail:** Simple or Detailed.
+- **Theme:** System, Light or Dark.
+- **Automatic RAM refresh:** on/off.
+- **Foreground refresh interval:** 1, 2, 5 or 10 seconds; 2 seconds remains the default.
+- **Refresh RAM now:** immediate `/proc`/ZRAM refresh even when automatic refresh is disabled.
+- **Refresh app/process memory now:** explicit rooted PSS/SwapPss scan.
+- **Root access:** current session status plus grant/retry action.
+- **App updates:** installed version, latest green build, staged update state, manual check/install actions and GitHub release access.
+- **Automatic green-build checks:** periodically discover, download and verify newer passed `main` builds.
+- **Automatic verified installation:** independently controls whether an automatically discovered verified APK may be installed unattended with previously granted root. Turning this off still allows automatic checks/downloads and leaves the APK staged for manual installation.
+
+The aggressive RAM-reclaim action remains separate from Settings because it is an explicit operational action, not a passive preference.
 
 ## Latest green build baseline
 
@@ -46,9 +66,9 @@ True RAM Usage reads the public GitHub Releases API for `tbzmike/True-ram-usage`
 - the release signing-certificate SHA-256 against the currently installed app,
 - the downloaded APK signing certificate against the currently installed app.
 
-Manual updates are available from the floating **Updates** control. **Check for updates** queries the latest green release. A newer verified build can be downloaded and installed immediately. Root installation is attempted first; if root is unavailable, Android's normal package installer is opened. Android 8 and later may require the user to allow True RAM Usage as an install source before the normal installer can proceed.
+Manual updates live in **Settings → App updates**. **Check for updates now** queries the latest green release. A newer verified build can be downloaded and installed immediately. Root installation is attempted first; if root is unavailable, Android's normal package installer is opened. Android 8 and later may require the user to allow True RAM Usage as an install source before the normal installer can proceed.
 
-Automatic updates are enabled by default. WorkManager checks for a newer green release every six hours when network connectivity is available. A newer APK is downloaded and verified in the app's private storage. If root has previously been granted to True RAM Usage, unattended root installation is attempted. If unattended installation is unavailable, the verified APK remains staged and the Updates control offers manual installation the next time the app is opened.
+Automatic green-build checks are enabled by default. WorkManager checks for a newer green release every six hours when network connectivity is available. A newer APK is downloaded and verified in the app's private storage. Automatic installation is a separate persisted setting and is also enabled by default to preserve the existing updater behavior. When automatic installation is enabled and root has previously been granted, unattended root installation is attempted. When it is disabled or root is unavailable, the verified APK remains staged and Settings offers manual installation.
 
 ## Physical RAM accounting
 
@@ -132,7 +152,7 @@ The **Aggressive reclaim** control combines and extends these steps when the goa
 
 ## Monitoring overhead
 
-The 2-second system memory poll runs only while the Activity is started. It is cancelled in the background and restarted when the app returns to the foreground. Expensive PSS/SwapPss process scans remain explicit rather than running continuously.
+Automatic system-memory polling runs only while the Activity is started. It is cancelled in the background and restarted when the app returns to the foreground. Settings can disable automatic polling entirely or choose a 1, 2, 5 or 10 second foreground interval; the default remains 2 seconds. When automatic polling is disabled, opening the Activity still performs one fresh memory read, and manual refresh remains available. Expensive PSS/SwapPss process scans remain explicit rather than running continuously.
 
 ## Capability levels
 
