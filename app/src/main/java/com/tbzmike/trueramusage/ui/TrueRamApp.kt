@@ -58,6 +58,7 @@ import com.tbzmike.trueramusage.data.RootState
 import com.tbzmike.trueramusage.data.RunningAppUsage
 import com.tbzmike.trueramusage.data.SwapDevice
 import com.tbzmike.trueramusage.data.ThemeMode
+import com.tbzmike.trueramusage.data.UnmappedProcessUsage
 import com.tbzmike.trueramusage.data.ZramClearSafety
 import com.tbzmike.trueramusage.data.ZramDevice
 import java.util.Locale
@@ -98,6 +99,8 @@ private fun AppTheme(themeMode: ThemeMode, content: @Composable () -> Unit) {
 private fun AppScreen(vm: MemoryViewModel) {
     var appToClose by remember { mutableStateOf<AppSwapUsage?>(null) }
     var confirmCloseAll by remember { mutableStateOf(false) }
+    var confirmCloseAllUserApps by remember { mutableStateOf(false) }
+    var confirmReclaimCaches by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     val snapshot = vm.snapshot
 
@@ -111,7 +114,7 @@ private fun AppScreen(vm: MemoryViewModel) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("True RAM Usage", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-            Text("Real memory information in plain language.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Real RAM, ZRAM and process memory information in plain language.", color = MaterialTheme.colorScheme.onSurfaceVariant)
 
             PreferencesSection(vm)
             AccessSection(vm)
@@ -124,6 +127,7 @@ private fun AppScreen(vm: MemoryViewModel) {
 
             OverviewCharts(snapshot)
             RamSection(snapshot, vm.displayMode)
+            MemoryBreakdownSection(snapshot, vm.displayMode)
             SwapSection(snapshot, vm.displayMode)
 
             if (snapshot.zramDevices.isEmpty()) {
@@ -132,6 +136,16 @@ private fun AppScreen(vm: MemoryViewModel) {
                 }
             } else {
                 snapshot.zramDevices.forEach { ZramSection(it, vm.displayMode) }
+            }
+
+            if (vm.rootState == RootState.GRANTED) {
+                RecoverySection(
+                    snapshot = snapshot,
+                    hasRunningApps = vm.runningApps.any { !it.isSystemApp },
+                    busy = vm.actionInProgress,
+                    closeAllUserApps = { confirmCloseAllUserApps = true },
+                    reclaimCaches = { confirmReclaimCaches = true }
+                )
             }
 
             if (vm.rootState == RootState.GRANTED && snapshot.activeZramSwapDevices.isNotEmpty()) {
@@ -158,6 +172,13 @@ private fun AppScreen(vm: MemoryViewModel) {
                     vm.displayMode,
                     vm::refreshAppsNow
                 )
+                UnmappedProcessesSection(
+                    vm.unmappedProcesses,
+                    vm.appsScanInProgress,
+                    vm.appsScanError,
+                    snapshot.onlyKernelZramActive,
+                    vm.displayMode
+                )
             }
 
             if (vm.displayMode == DisplayMode.DETAILED) AdvancedSection(snapshot)
@@ -175,7 +196,7 @@ private fun AppScreen(vm: MemoryViewModel) {
         AlertDialog(
             onDismissRequest = { appToClose = null },
             title = { Text("Close ${app.label}?") },
-            text = { Text("This force-stops the app so its ${formatBytes(app.attributedSwapBytes)} of private swapped memory can be released.") },
+            text = { Text("This force-stops the app so Android can release its ${formatBytes(app.attributedRamBytes)} of attributed RAM and ${formatBytes(app.attributedSwapBytes)} of attributed swapped memory.") },
             confirmButton = { Button(onClick = { appToClose = null; vm.closeAndRelease(app) }) { Text("Close & release") } },
             dismissButton = { TextButton(onClick = { appToClose = null }) { Text("Cancel") } }
         )
@@ -184,10 +205,30 @@ private fun AppScreen(vm: MemoryViewModel) {
     if (confirmCloseAll) {
         AlertDialog(
             onDismissRequest = { confirmCloseAll = false },
-            title = { Text("Close all user apps using ZRAM?") },
-            text = { Text("Every non-system app currently reporting swapped memory will be force-stopped. True RAM Usage and protected system apps are excluded.") },
+            title = { Text("Close all user apps using ZRAM/swap?") },
+            text = { Text("Every non-system app currently reporting attributed swapped memory will be force-stopped. True RAM Usage and protected system apps are excluded.") },
             confirmButton = { Button(onClick = { confirmCloseAll = false; vm.closeAllAppsInZram() }) { Text("Close all") } },
             dismissButton = { TextButton(onClick = { confirmCloseAll = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (confirmCloseAllUserApps) {
+        AlertDialog(
+            onDismissRequest = { confirmCloseAllUserApps = false },
+            title = { Text("Close all running user apps?") },
+            text = { Text("This force-stops every mapped non-system user app except True RAM Usage. It is intended for diagnosing or reclaiming unusually full RAM; Android may restart apps that provide required services.") },
+            confirmButton = { Button(onClick = { confirmCloseAllUserApps = false; vm.closeAllUserApps() }) { Text("Close user apps") } },
+            dismissButton = { TextButton(onClick = { confirmCloseAllUserApps = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (confirmReclaimCaches) {
+        AlertDialog(
+            onDismissRequest = { confirmReclaimCaches = false },
+            title = { Text("Reclaim clean caches?") },
+            text = { Text("This runs sync and asks the kernel to drop clean page cache plus reclaimable dentries/inodes. It does not discard anonymous app memory or required kernel memory, but apps may load data more slowly until caches warm again.") },
+            confirmButton = { Button(onClick = { confirmReclaimCaches = false; vm.reclaimFileCaches() }) { Text("Reclaim caches") } },
+            dismissButton = { TextButton(onClick = { confirmReclaimCaches = false }) { Text("Cancel") } }
         )
     }
 
@@ -195,7 +236,7 @@ private fun AppScreen(vm: MemoryViewModel) {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("Clear kernel ZRAM?") },
-            text = { Text("The existing ZRAM swap is temporarily disabled and re-enabled only if the safety check says enough physical RAM is available.") },
+            text = { Text("The existing ZRAM swap is temporarily disabled and re-enabled only if the safety estimate shows enough physical RAM to bring the swapped pages back first.") },
             confirmButton = { Button(onClick = { confirmClear = false; vm.clearKernelZram() }) { Text("Clear ZRAM") } },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
         )
@@ -230,7 +271,7 @@ private fun AccessSection(vm: MemoryViewModel) {
     }
     Section("Access", summary, vm.rootState != RootState.GRANTED) {
         when (vm.rootState) {
-            RootState.GRANTED -> Text("Full kernel ZRAM and running-app process access is enabled.")
+            RootState.GRANTED -> Text("Full kernel ZRAM, proportional PSS/SwapPss and process diagnostics are enabled where the kernel exposes them.")
             RootState.NOT_REQUESTED -> Button(onClick = vm::requestRoot, enabled = !vm.rootRequestInProgress) { Text("Grant root access") }
             RootState.DENIED_OR_TIMED_OUT -> Button(onClick = vm::requestRoot, enabled = !vm.rootRequestInProgress) { Text("Retry root access") }
             RootState.UNAVAILABLE -> Text("No compatible root command was found.")
@@ -275,7 +316,33 @@ private fun RamSection(s: MemorySnapshot, mode: DisplayMode) {
     Section("Physical RAM", "${formatBytes(s.usedRamBytes)} of ${formatBytes(s.totalRamBytes)} used", mode == DisplayMode.DETAILED) {
         Value("Used", formatPercent(fraction(s.usedRamBytes, s.totalRamBytes).toDouble() * 100.0))
         Value("Available", formatBytes(s.availableRamBytes))
-        if (mode == DisplayMode.DETAILED) Text("Used RAM is MemTotal minus MemAvailable, which accounts for reclaimable memory better than a free-RAM figure.", style = MaterialTheme.typography.bodySmall)
+        if (s.zramPhysicalRamBytes > 0L) Value("Used by ZRAM itself", formatBytes(s.zramPhysicalRamBytes))
+        if (mode == DisplayMode.DETAILED) Text("Used RAM is MemTotal minus MemAvailable. ZRAM's physical-RAM cost is already inside that used-RAM figure and is shown separately only to explain where part of it went.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun MemoryBreakdownSection(s: MemorySnapshot, mode: DisplayMode) {
+    val b = s.breakdown
+    Section("Where physical RAM is going", "Anonymous ${formatBytes(b.anonymousBytes)} • Cache ${formatBytes(b.cachedBytes)} • Slab ${formatBytes(b.slabBytes)}", mode == DisplayMode.DETAILED) {
+        Value("Anonymous pages", formatBytes(b.anonymousBytes))
+        Value("File/page cache", formatBytes(b.cachedBytes))
+        Value("Shared memory (shmem)", formatBytes(b.shmemBytes))
+        Value("Kernel slab", formatBytes(b.slabBytes))
+        if (mode == DisplayMode.DETAILED) {
+            Value("Truly free pages", formatBytes(b.freeBytes))
+            Value("Buffers", formatBytes(b.buffersBytes))
+            Value("Swap cache", formatBytes(b.swapCachedBytes))
+            Value("Reclaimable slab", formatBytes(b.reclaimableSlabBytes))
+            Value("Unreclaimable slab", formatBytes(b.unreclaimableSlabBytes))
+            Value("Kernel stacks", formatBytes(b.kernelStackBytes))
+            Value("Page tables", formatBytes(b.pageTablesBytes))
+            Value("Unevictable", formatBytes(b.unevictableBytes))
+            Value("Mlocked", formatBytes(b.mlockedBytes))
+            Value("Dirty pages", formatBytes(b.dirtyBytes))
+            Value("Writeback", formatBytes(b.writebackBytes))
+        }
+        Text("These are direct /proc/meminfo counters and some categories overlap, so they should be diagnosed individually rather than added together as a second RAM total.", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -309,12 +376,28 @@ private fun ZramSection(z: ZramDevice, mode: DisplayMode) {
 }
 
 @Composable
+private fun RecoverySection(
+    snapshot: MemorySnapshot,
+    hasRunningApps: Boolean,
+    busy: Boolean,
+    closeAllUserApps: () -> Unit,
+    reclaimCaches: () -> Unit
+) {
+    Section("RAM recovery & diagnosis", "${formatBytes(snapshot.availableRamBytes)} available physical RAM", false) {
+        Text("Physical RAM cannot be made literally empty: Android, the kernel and caches immediately use memory again. These controls free reclaimable/user memory so you can see what remains and identify a kernel/system problem instead of hiding it.")
+        Text("Recommended diagnostic order: close user apps → reclaim clean caches → refresh readings → clear ZRAM only when the safety estimate allows it.", style = MaterialTheme.typography.bodySmall)
+        Button(onClick = closeAllUserApps, enabled = hasRunningApps && !busy, modifier = Modifier.fillMaxWidth()) { Text("Close all running user apps") }
+        Button(onClick = reclaimCaches, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Reclaim clean file/kernel caches") }
+    }
+}
+
+@Composable
 private fun ControlsSection(s: MemorySnapshot, safety: ZramClearSafety?, busy: Boolean, onClear: () -> Unit) {
     Section("ZRAM controls", "${formatBytes(s.kernelZramSwapUsedBytes)} currently swapped", false) {
         when {
-            safety == null -> Text("Checking safety…")
-            safety.canClear -> Text("Enough physical RAM is available for a guarded clear.")
-            safety.additionalNeededBytes > 0 -> Text("Clear is blocked for safety. About ${formatBytes(safety.additionalNeededBytes)} more available RAM is needed.")
+            safety == null -> Text("Checking safety estimate…")
+            safety.canClear -> Text("The safety estimate currently shows enough physical RAM to cycle ZRAM.")
+            safety.additionalNeededBytes > 0 -> Text("ZRAM clear is blocked. About ${formatBytes(safety.additionalNeededBytes)} more available RAM is needed before swapoff is attempted.")
             else -> Text("No active ZRAM device was detected.")
         }
         Button(onClick = onClear, enabled = safety?.canClear == true && !busy, modifier = Modifier.fillMaxWidth()) { Text("Clear kernel ZRAM") }
@@ -331,21 +414,21 @@ private fun AppsInSwapSection(
     val summary = when {
         scanning -> "Scanning…"
         error != null -> "Scan error"
-        apps.isEmpty() -> "No private swapped app pages found"
-        else -> "${apps.size} apps • ${formatBytes(total)} swapped"
+        apps.isEmpty() -> "No attributed swapped app pages found"
+        else -> "${apps.size} apps • ${formatBytes(total)} attributed swap"
     }
     Section(if (zramOnly) "Apps using ZRAM" else "Apps using swap", summary, false) {
         when {
-            scanning -> Text("Reading per-process memory counters…")
+            scanning -> Text("Reading per-process RSS/VmSwap plus PSS/SwapPss where the kernel exposes smaps_rollup…")
             error != null -> InfoCard("App scan failed", error)
-            apps.isEmpty() -> Text("No installed app currently reports private swapped pages.")
+            apps.isEmpty() -> Text("No mapped app currently reports attributable swapped pages.")
             else -> {
                 if (apps.any { !it.isSystemApp }) Button(onClick = closeAll, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Close all user apps from ${if (zramOnly) "ZRAM" else "swap"}") }
                 apps.forEach { AppSwapRow(it, zramOnly, mode, busy, close) }
             }
         }
         Button(onClick = refresh, enabled = !scanning && !busy, modifier = Modifier.fillMaxWidth()) { Text(if (scanning) "Scanning…" else "Refresh app list") }
-        if (mode == DisplayMode.DETAILED) Text("Per-app swap uses VmSwap, which reports private process pages. Shared tmpfs/shmem swap is not assigned to an individual app.", style = MaterialTheme.typography.bodySmall)
+        if (mode == DisplayMode.DETAILED) Text("SwapPss is used when available so shared swapped pages are proportionally attributed. VmSwap remains the raw private-swap fallback for processes where smaps_rollup cannot be read.", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -354,31 +437,36 @@ private fun AppSwapRow(app: AppSwapUsage, zramOnly: Boolean, mode: DisplayMode, 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(app.label, fontWeight = FontWeight.Bold)
-            Text(location(app.residentBytes, app.attributedSwapBytes, zramOnly), color = MaterialTheme.colorScheme.primary)
-            Value(if (zramOnly) "In ZRAM" else "Swapped", formatBytes(app.attributedSwapBytes))
+            Text(location(app.attributedRamBytes, app.attributedSwapBytes, zramOnly), color = MaterialTheme.colorScheme.primary)
+            Value(if (zramOnly) "Attributed in ZRAM" else "Attributed swap", formatBytes(app.attributedSwapBytes))
             if (mode == DisplayMode.DETAILED) {
-                Value("Physical RAM", formatBytes(app.residentBytes))
+                Value("Attributed physical RAM", formatBytes(app.attributedRamBytes))
+                Value("Raw RSS", formatBytes(app.residentBytes))
+                Value("Raw VmSwap", formatBytes(app.rawSwapBytes))
                 Value("Running for", formatDuration(app.runningSeconds))
                 Value("CPU time since start", formatCpu(app.cpuTimeSeconds))
                 if (app.processCount > 1) Value("Processes", app.processCount.toString())
+                if (app.isolatedProcessCount > 0) Value("Name-mapped / isolated processes", app.isolatedProcessCount.toString())
+                if (!app.proportionalMetricsAvailable) Text("One or more processes used RSS/VmSwap fallback because proportional counters were unavailable.", style = MaterialTheme.typography.bodySmall)
             }
             if (app.isSystemApp) Text("System app — protected", style = MaterialTheme.typography.bodySmall)
-            else Button(onClick = { close(app) }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Close app & release swapped memory") }
+            else Button(onClick = { close(app) }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Close app & release memory") }
         }
     }
 }
 
 @Composable
 private fun RunningAppsSection(apps: List<RunningAppUsage>, scanning: Boolean, error: String?, zramOnly: Boolean, mode: DisplayMode, refresh: () -> Unit) {
+    val totalAttributed = apps.sumOf { it.attributedRamBytes }
     val summary = when {
         scanning -> "Scanning…"
         error != null -> "Scan error"
         apps.isEmpty() -> "No mapped running apps"
-        else -> "${apps.size} mapped Android apps"
+        else -> "${apps.size} mapped apps • ${formatBytes(totalAttributed)} attributed RAM"
     }
     Section("Running apps", summary, false) {
         when {
-            scanning -> Text("Reading RAM, swap, runtime and CPU counters…")
+            scanning -> Text("Reading RAM, PSS, swap, runtime and CPU counters…")
             error != null -> InfoCard("Running-app scan failed", error)
             apps.isEmpty() -> Text("No running Android apps could be mapped from the current process table.")
             else -> apps.forEach { RunningRow(it, zramOnly, mode) }
@@ -392,17 +480,61 @@ private fun RunningRow(app: RunningAppUsage, zramOnly: Boolean, mode: DisplayMod
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(app.label, fontWeight = FontWeight.Bold)
-            Text(location(app.residentBytes, app.swapBytes, zramOnly), color = MaterialTheme.colorScheme.primary)
+            Text(location(app.attributedRamBytes, app.attributedSwapBytes, zramOnly), color = MaterialTheme.colorScheme.primary)
             if (mode == DisplayMode.SIMPLE) {
-                Value("Memory", formatBytes(app.residentBytes + app.swapBytes))
+                Value("Attributed memory", formatBytes(app.attributedRamBytes + app.attributedSwapBytes))
             } else {
-                Value("Physical RAM", formatBytes(app.residentBytes))
-                Value(if (zramOnly) "ZRAM" else "Swap", formatBytes(app.swapBytes))
+                Value("Attributed physical RAM", formatBytes(app.attributedRamBytes))
+                Value(if (zramOnly) "Attributed ZRAM" else "Attributed swap", formatBytes(app.attributedSwapBytes))
+                Value("Raw RSS", formatBytes(app.residentBytes))
+                Value("Raw VmSwap", formatBytes(app.swapBytes))
                 Value("Running for", formatDuration(app.runningSeconds))
                 Value("CPU time since start", formatCpu(app.cpuTimeSeconds))
                 Value("Processes", app.processCount.toString())
+                if (app.isolatedProcessCount > 0) Value("Name-mapped / isolated processes", app.isolatedProcessCount.toString())
+                if (!app.proportionalMetricsAvailable) Text("At least one process fell back to RSS/VmSwap; proportional PSS/SwapPss is used for the others.", style = MaterialTheme.typography.bodySmall)
                 if (app.isSystemApp) Text("System app", style = MaterialTheme.typography.bodySmall)
             }
+        }
+    }
+}
+
+@Composable
+private fun UnmappedProcessesSection(
+    processes: List<UnmappedProcessUsage>,
+    scanning: Boolean,
+    error: String?,
+    zramOnly: Boolean,
+    mode: DisplayMode
+) {
+    if (mode != DisplayMode.DETAILED) return
+    val nonZero = processes.filter { it.attributedRamBytes > 0L || it.attributedSwapBytes > 0L }
+    val shown = nonZero.take(40)
+    val total = nonZero.sumOf { it.attributedRamBytes }
+    val summary = when {
+        scanning -> "Scanning…"
+        error != null -> "Scan error"
+        nonZero.isEmpty() -> "No non-zero native/unmapped processes"
+        else -> "${nonZero.size} processes • ${formatBytes(total)} attributed RAM"
+    }
+    Section("Native / unmapped processes", summary, false) {
+        Text("These processes are visible in /proc but could not be safely assigned to an installed Android package. This is important when RAM remains high after user apps are closed.", style = MaterialTheme.typography.bodySmall)
+        shown.forEach { UnmappedRow(it, zramOnly) }
+        if (nonZero.size > shown.size) Text("Showing the 40 largest of ${nonZero.size} non-zero unmapped processes.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun UnmappedRow(process: UnmappedProcessUsage, zramOnly: Boolean) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(process.processName, fontWeight = FontWeight.Bold)
+            Value("PID / UID", "${process.pid} / ${process.uid}")
+            Value("Attributed physical RAM", formatBytes(process.attributedRamBytes))
+            Value(if (zramOnly) "Attributed ZRAM" else "Attributed swap", formatBytes(process.attributedSwapBytes))
+            Value("Raw RSS", formatBytes(process.residentBytes))
+            Value("Raw VmSwap", formatBytes(process.swapBytes))
+            if (!process.proportionalMetricsAvailable) Text("PSS/SwapPss unavailable — RSS/VmSwap fallback.", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
